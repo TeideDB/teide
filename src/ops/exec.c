@@ -7621,7 +7621,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
     if (!result || TD_IS_ERR(result)) goto join_cleanup;
 
     /* Count non-key right columns for multi_gather sizing */
-    int64_t right_out_ncols = 0;
+    int64_t right_out_ncols __attribute__((unused)) = 0;
     for (int64_t c = 0; c < right_ncols; c++) {
         int64_t name_id = td_table_col_name(right_table, c);
         bool is_key = false;
@@ -8368,6 +8368,7 @@ static td_t* exec_extract(td_graph_t* g, td_op_t* op) {
 
     int64_t* out = (int64_t*)td_data(result);
 
+    #undef  USEC_PER_SEC
     #define USEC_PER_SEC  1000000LL
     #define USEC_PER_MIN  (60LL  * USEC_PER_SEC)
     #define USEC_PER_HOUR (3600LL * USEC_PER_SEC)
