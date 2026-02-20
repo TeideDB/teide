@@ -84,9 +84,11 @@ static void graph_fixup_ext_ptrs(td_graph_t* g, ptrdiff_t delta) {
     }
 }
 
-/* After realloc moves g->nodes, fix up all stored input pointers */
-static void graph_fixup_ptrs(td_graph_t* g, td_op_t* old_nodes) {
-    ptrdiff_t delta = (char*)g->nodes - (char*)old_nodes;
+/* After realloc moves g->nodes, fix up all stored input pointers.
+   old_base is saved as uintptr_t before realloc to avoid GCC 14
+   -Wuse-after-free on the stale pointer. */
+static void graph_fixup_ptrs(td_graph_t* g, uintptr_t old_base) {
+    ptrdiff_t delta = (ptrdiff_t)((uintptr_t)g->nodes - old_base);
     if (delta == 0) return;
     for (uint32_t i = 0; i < g->node_count; i++) {
         g->nodes[i].inputs[0] = graph_fix_ptr(g->nodes[i].inputs[0], delta);
@@ -99,7 +101,7 @@ static void graph_fixup_ptrs(td_graph_t* g, td_op_t* old_nodes) {
    unreachable in practice (would require ~128 GB for the nodes array). */
 static td_op_t* graph_alloc_node(td_graph_t* g) {
     if (g->node_count >= g->node_cap) {
-        td_op_t* old_nodes = g->nodes;
+        uintptr_t old_base = (uintptr_t)g->nodes;
         /* H2: Overflow guard — if node_cap is already > UINT32_MAX/2,
            doubling would wrap around to a smaller value. */
         if (g->node_cap > UINT32_MAX / 2) return NULL;
@@ -109,7 +111,7 @@ static td_op_t* graph_alloc_node(td_graph_t* g) {
         if (!new_nodes) return NULL;
         g->nodes = new_nodes;
         g->node_cap = new_cap;
-        graph_fixup_ptrs(g, old_nodes);
+        graph_fixup_ptrs(g, old_base);
     }
     td_op_t* n = &g->nodes[g->node_count];
     memset(n, 0, sizeof(td_op_t));
@@ -126,14 +128,14 @@ static td_op_ext_t* graph_alloc_ext_node_ex(td_graph_t* g, size_t extra) {
     /* Also add a placeholder in the nodes array for ID tracking */
     if (g->node_count >= g->node_cap) {
         if (g->node_cap > UINT32_MAX / 2) { td_sys_free(ext); return NULL; }
-        td_op_t* old_nodes = g->nodes;
+        uintptr_t old_base = (uintptr_t)g->nodes;
         uint32_t new_cap = g->node_cap * 2;
         td_op_t* new_nodes = (td_op_t*)td_sys_realloc(g->nodes,
                                                       new_cap * sizeof(td_op_t));
         if (!new_nodes) { td_sys_free(ext); return NULL; }
         g->nodes = new_nodes;
         g->node_cap = new_cap;
-        graph_fixup_ptrs(g, old_nodes);
+        graph_fixup_ptrs(g, old_base);
     }
     ext->base.id = g->node_count;
     /* H4: Do NOT copy ext->base to nodes[] here — the caller fills in

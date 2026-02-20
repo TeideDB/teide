@@ -99,7 +99,9 @@ TD_INLINE void heap_insert_block(td_heap_t* h, td_t* blk, uint8_t order) {
     h->avail |= (1ULL << order);
 }
 
-TD_INLINE void heap_remove_block(td_heap_t* h, td_t* blk, uint8_t order) {
+/* heap_remove_block: currently unused — retained for future coalescing paths */
+static void __attribute__((unused))
+heap_remove_block(td_heap_t* h, td_t* blk, uint8_t order) {
     fl_remove(blk);  /* circular unlink — works across heaps */
     if (fl_empty(&h->freelist[order]))
         h->avail &= ~(1ULL << order);
