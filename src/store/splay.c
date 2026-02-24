@@ -47,8 +47,11 @@ td_err_t td_splay_save(td_t* tbl, const char* dir, const char* sym_path) {
     if (!tbl || TD_IS_ERR(tbl)) return TD_ERR_TYPE;
     if (!dir) return TD_ERR_IO;
 
-    /* sym_path saving is Phase 2 — ignore for now */
-    (void)sym_path;
+    /* Save symbol table if sym_path provided */
+    if (sym_path) {
+        td_err_t sym_err = td_sym_save(sym_path);
+        if (sym_err != TD_OK) return sym_err;
+    }
 
     /* Create directory */
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) return TD_ERR_IO;
@@ -174,8 +177,13 @@ td_t* td_splay_load(const char* dir) {
 td_t* td_read_splayed(const char* dir, const char* sym_path) {
     if (!dir) return TD_ERR_PTR(TD_ERR_IO);
 
-    /* sym_path loading is Phase 2 — ignore for now */
-    (void)sym_path;
+    /* Load symbol table if sym_path provided */
+    if (sym_path) {
+        td_err_t sym_err = td_sym_load(sym_path);
+        if (sym_err != TD_OK) {
+            /* Non-fatal: proceed without symbols; columns may be unnamed */
+        }
+    }
 
     /* Path buffer limited to 1024 chars — paths exceeding this are silently skipped. */
     /* Load .d schema (small, use td_col_load — buddy copy is fine) */
