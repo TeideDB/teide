@@ -986,7 +986,7 @@ td_op_t* td_date_trunc(td_graph_t* g, td_op_t* col, int64_t field) {
     ext->base.opcode = OP_DATE_TRUNC;
     ext->base.arity = 1;
     ext->base.inputs[0] = col;
-    ext->base.out_type = TD_I64;  /* returns timestamp (microseconds) */
+    ext->base.out_type = TD_TIMESTAMP;  /* returns timestamp (microseconds) */
     ext->base.est_rows = est;
     ext->sym = field;
 

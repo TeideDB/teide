@@ -221,7 +221,12 @@ td_t* td_vec_concat(td_t* a, td_t* b) {
     if (a->type != b->type)
         return TD_ERR_PTR(TD_ERR_TYPE);
 
-    uint8_t esz = td_sym_elem_size(a->type, a->attrs);
+    uint8_t a_esz = td_sym_elem_size(a->type, a->attrs);
+    uint8_t b_esz = td_sym_elem_size(b->type, b->attrs);
+    /* Use the wider of the two widths for SYM columns */
+    uint8_t out_attrs = (a_esz >= b_esz) ? a->attrs : b->attrs;
+    uint8_t esz = (a_esz >= b_esz) ? a_esz : b_esz;
+
     int64_t total_len = a->len + b->len;
     if (total_len < a->len) return TD_ERR_PTR(TD_ERR_OOM); /* overflow */
     size_t data_size = (size_t)total_len * esz;
@@ -233,21 +238,33 @@ td_t* td_vec_concat(td_t* a, td_t* b) {
 
     result->type = a->type;
     result->len = total_len;
-    result->attrs = a->attrs;  /* preserve SYM width attrs */
+    result->attrs = out_attrs;
     memset(result->nullmap, 0, 16);
 
-    /* Copy data from a */
-    void* a_data = (a->attrs & TD_ATTR_SLICE) ?
-        ((char*)td_data(a->slice_parent) + a->slice_offset * esz) :
-        td_data(a);
-    memcpy(td_data(result), a_data, (size_t)a->len * esz);
+    /* For SYM with mismatched widths, widen element-by-element */
+    if (a->type == TD_SYM && a_esz != b_esz) {
+        void* dst = td_data(result);
+        for (int64_t i = 0; i < a->len; i++) {
+            int64_t val = td_read_sym(td_data(a), i, a->type, a->attrs);
+            td_write_sym(dst, i, (uint64_t)val, result->type, result->attrs);
+        }
+        for (int64_t i = 0; i < b->len; i++) {
+            int64_t val = td_read_sym(td_data(b), i, b->type, b->attrs);
+            td_write_sym(dst, a->len + i, (uint64_t)val, result->type, result->attrs);
+        }
+    } else {
+        /* Same width: fast memcpy path */
+        void* a_data = (a->attrs & TD_ATTR_SLICE) ?
+            ((char*)td_data(a->slice_parent) + a->slice_offset * esz) :
+            td_data(a);
+        memcpy(td_data(result), a_data, (size_t)a->len * esz);
 
-    /* Copy data from b */
-    void* b_data = (b->attrs & TD_ATTR_SLICE) ?
-        ((char*)td_data(b->slice_parent) + b->slice_offset * esz) :
-        td_data(b);
-    memcpy((char*)td_data(result) + (size_t)a->len * esz, b_data,
-           (size_t)b->len * esz);
+        void* b_data = (b->attrs & TD_ATTR_SLICE) ?
+            ((char*)td_data(b->slice_parent) + b->slice_offset * esz) :
+            td_data(b);
+        memcpy((char*)td_data(result) + (size_t)a->len * esz, b_data,
+               (size_t)b->len * esz);
+    }
 
     /* LIST/TABLE columns hold child pointers — retain them */
     if (a->type == TD_LIST || a->type == TD_TABLE) {

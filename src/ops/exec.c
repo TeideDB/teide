@@ -7819,23 +7819,9 @@ static td_t* exec_if(td_graph_t* g, td_op_t* op) {
         for (int64_t i = 0; i < len; i++)
             dst[i] = cond_p[i] ? (t_arr ? t_arr[i] : t_scalar)
                                : (e_arr ? e_arr[i] : e_scalar);
-    } else if (out_type == TD_I64 || out_type == TD_SYM) {
-        /* For SYM output with string scalar constants, intern to get SYM IDs */
-        int64_t t_scalar = 0, e_scalar = 0;
-        if (then_scalar) {
-            if (then_v->type == TD_ATOM_STR) {
-                t_scalar = td_sym_intern(td_str_ptr(then_v), td_str_len(then_v));
-            } else {
-                t_scalar = then_v->i64;
-            }
-        }
-        if (else_scalar) {
-            if (else_v->type == TD_ATOM_STR) {
-                e_scalar = td_sym_intern(td_str_ptr(else_v), td_str_len(else_v));
-            } else {
-                e_scalar = else_v->i64;
-            }
-        }
+    } else if (out_type == TD_I64) {
+        int64_t t_scalar = then_scalar ? then_v->i64 : 0;
+        int64_t e_scalar = else_scalar ? else_v->i64 : 0;
         int64_t* t_arr = then_scalar ? NULL : (int64_t*)td_data(then_v);
         int64_t* e_arr = else_scalar ? NULL : (int64_t*)td_data(else_v);
         int64_t* dst = (int64_t*)td_data(result);
@@ -7852,8 +7838,23 @@ static td_t* exec_if(td_graph_t* g, td_op_t* op) {
             dst[i] = cond_p[i] ? (t_arr ? t_arr[i] : t_scalar)
                                : (e_arr ? e_arr[i] : e_scalar);
     } else if (out_type == TD_SYM) {
-        int64_t t_scalar = then_scalar ? then_v->i64 : 0;
-        int64_t e_scalar = else_scalar ? else_v->i64 : 0;
+        /* SYM columns may have narrow widths (W8/W16/W32) — use td_read_sym.
+         * Scalars may be string atoms that need interning. Output is always W64. */
+        int64_t t_scalar = 0, e_scalar = 0;
+        if (then_scalar) {
+            if (then_v->type == TD_ATOM_STR) {
+                t_scalar = td_sym_intern(td_str_ptr(then_v), td_str_len(then_v));
+            } else {
+                t_scalar = then_v->i64;
+            }
+        }
+        if (else_scalar) {
+            if (else_v->type == TD_ATOM_STR) {
+                e_scalar = td_sym_intern(td_str_ptr(else_v), td_str_len(else_v));
+            } else {
+                e_scalar = else_v->i64;
+            }
+        }
         int64_t* dst = (int64_t*)td_data(result);
         for (int64_t i = 0; i < len; i++) {
             int64_t tv = then_scalar ? t_scalar
@@ -8343,10 +8344,11 @@ static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
 }
 
 /* ============================================================================
- * EXTRACT — date/time component extraction from timestamps
+ * EXTRACT — date/time component extraction from temporal columns
  *
- * Input:  i64 vector of microseconds since 2000-01-01T00:00:00Z
- * Output: i64 vector of extracted field values
+ * Input:  TD_TIMESTAMP (i64 µs since 2000-01-01), TD_DATE (i32 days since
+ *         2000-01-01), or TD_TIME (i32 ms since midnight).
+ * Output: i64 vector of extracted field values.
  *
  * Uses Howard Hinnant's civil_from_days algorithm (public domain) for
  * Gregorian calendar decomposition.
@@ -8361,6 +8363,7 @@ static td_t* exec_extract(td_graph_t* g, td_op_t* op) {
 
     int64_t field = ext->sym;
     int64_t len = input->len;
+    int8_t in_type = input->type;
 
     td_t* result = td_vec_new(TD_I64, len);
     if (!result || TD_IS_ERR(result)) { td_release(input); return result; }
@@ -8380,10 +8383,21 @@ static td_t* exec_extract(td_graph_t* g, td_op_t* op) {
 
     while (td_morsel_next(&m)) {
         int64_t n = m.morsel_len;
-        const int64_t* src = (const int64_t*)m.morsel_ptr;
 
         for (int64_t i = 0; i < n; i++) {
-            int64_t us = src[i];  /* microseconds since 2000-01-01 */
+            int64_t us;
+            if (in_type == TD_DATE) {
+                /* int32 days since 2000-01-01 → microseconds */
+                int32_t d = ((const int32_t*)m.morsel_ptr)[i];
+                us = (int64_t)d * USEC_PER_DAY;
+            } else if (in_type == TD_TIME) {
+                /* int32 milliseconds since midnight → microseconds */
+                int32_t ms = ((const int32_t*)m.morsel_ptr)[i];
+                us = (int64_t)ms * 1000LL;
+            } else {
+                /* TD_TIMESTAMP / TD_I64: already microseconds */
+                us = ((const int64_t*)m.morsel_ptr)[i];
+            }
 
             if (field == TD_EXTRACT_EPOCH) {
                 out[off + i] = us;
@@ -8456,9 +8470,11 @@ static td_t* exec_extract(td_graph_t* g, td_op_t* op) {
 }
 
 /* ============================================================================
- * DATE_TRUNC — truncate timestamp to specified precision
+ * DATE_TRUNC — truncate temporal value to specified precision
  *
- * Returns microseconds since 2000-01-01 truncated to the given field.
+ * Input:  TD_TIMESTAMP (i64 µs since 2000-01-01), TD_DATE (i32 days since
+ *         2000-01-01), or TD_TIME (i32 ms since midnight).
+ * Output: TD_TIMESTAMP (i64 µs) — always returns microseconds since 2000-01-01.
  * Sub-day: modular arithmetic. Month/year: calendar decompose + recompose.
  * ============================================================================ */
 
@@ -8482,8 +8498,9 @@ static td_t* exec_date_trunc(td_graph_t* g, td_op_t* op) {
 
     int64_t field = ext->sym;
     int64_t len = input->len;
+    int8_t in_type = input->type;
 
-    td_t* result = td_vec_new(TD_I64, len);
+    td_t* result = td_vec_new(TD_TIMESTAMP, len);
     if (!result || TD_IS_ERR(result)) { td_release(input); return result; }
     result->len = len;
 
@@ -8500,10 +8517,18 @@ static td_t* exec_date_trunc(td_graph_t* g, td_op_t* op) {
 
     while (td_morsel_next(&m)) {
         int64_t n = m.morsel_len;
-        const int64_t* src = (const int64_t*)m.morsel_ptr;
 
         for (int64_t i = 0; i < n; i++) {
-            int64_t us = src[i];
+            int64_t us;
+            if (in_type == TD_DATE) {
+                int32_t d = ((const int32_t*)m.morsel_ptr)[i];
+                us = (int64_t)d * DT_USEC_PER_DAY;
+            } else if (in_type == TD_TIME) {
+                int32_t ms = ((const int32_t*)m.morsel_ptr)[i];
+                us = (int64_t)ms * 1000LL;
+            } else {
+                us = ((const int64_t*)m.morsel_ptr)[i];
+            }
 
             switch (field) {
                 case TD_EXTRACT_SECOND: {
