@@ -1967,7 +1967,7 @@ static td_t* exec_filter_seq(td_t* input, td_t* pred, int64_t ncols,
         if (col->type == TD_MAPCOMMON) {
             td_t* mc_filt = materialize_mapcommon_filter(col, pred, pass_count);
             if (!mc_filt || TD_IS_ERR(mc_filt)) { td_release(tbl); return mc_filt; }
-            td_table_add_col(tbl, name_id, mc_filt);
+            tbl = td_table_add_col(tbl, name_id, mc_filt);
             td_release(mc_filt);
             continue;
         }
@@ -1977,7 +1977,7 @@ static td_t* exec_filter_seq(td_t* input, td_t* pred, int64_t ncols,
         else
             filtered = exec_filter_vec(col, pred, pass_count);
         if (!filtered || TD_IS_ERR(filtered)) { td_release(tbl); return filtered; }
-        td_table_add_col(tbl, name_id, filtered);
+        tbl = td_table_add_col(tbl, name_id, filtered);
         td_release(filtered);
     }
     return tbl;
@@ -2136,7 +2136,7 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
 
     for (int64_t c = 0; c < ncols; c++) {
         if (!new_cols[c]) continue;
-        td_table_add_col(tbl, col_names[c], new_cols[c]);
+        tbl = td_table_add_col(tbl, col_names[c], new_cols[c]);
         td_release(new_cols[c]);
     }
 
@@ -2271,7 +2271,7 @@ static td_t* sel_compact(td_graph_t* g, td_t* tbl, td_t* sel) {
             td_t* nc = td_vec_new(ct, 0);
             if (nc && !TD_IS_ERR(nc)) {
                 nc->len = 0;
-                td_table_add_col(empty, td_table_col_name(tbl, c), nc);
+                empty = td_table_add_col(empty, td_table_col_name(tbl, c), nc);
                 td_release(nc);
             }
         }
@@ -2392,7 +2392,7 @@ static td_t* sel_compact(td_graph_t* g, td_t* tbl, td_t* sel) {
 
     for (int64_t c = 0; c < ncols; c++) {
         if (!new_cols[c]) continue;
-        td_table_add_col(out, col_names[c], new_cols[c]);
+        out = td_table_add_col(out, col_names[c], new_cols[c]);
         td_release(new_cols[c]);
     }
 

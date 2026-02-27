@@ -247,11 +247,11 @@ static MunitResult test_atom_date(const void* params, void* fixture) {
 static MunitResult test_atom_time(const void* params, void* fixture) {
     (void)params; (void)fixture;
 
-    td_t* v = td_time(43200000000000LL);  /* nanoseconds since midnight */
+    td_t* v = td_time(43200000);  /* milliseconds since midnight (12:00:00.000) */
     munit_assert_ptr_not_null(v);
     munit_assert_true(td_is_atom(v));
     munit_assert_int(v->type, ==, -TD_TIME);
-    munit_assert_int(v->i64, ==, 43200000000000LL);
+    munit_assert_int(v->i64, ==, 43200000);
     td_release(v);
 
     return MUNIT_OK;
