@@ -232,7 +232,7 @@ static MunitResult test_atom_sym(const void* params, void* fixture) {
 static MunitResult test_atom_date(const void* params, void* fixture) {
     (void)params; (void)fixture;
 
-    td_t* v = td_date(19700);  /* days since epoch */
+    td_t* v = td_date(19700);  /* days since 2000-01-01 */
     munit_assert_ptr_not_null(v);
     munit_assert_true(td_is_atom(v));
     munit_assert_int(v->type, ==, -TD_DATE);

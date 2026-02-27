@@ -649,9 +649,9 @@ strtod_fallback:
 /* --------------------------------------------------------------------------
  * Fast inline date/time parsers
  *
- * DATE:      YYYY-MM-DD        → int32_t  (days since 1970-01-01)
+ * DATE:      YYYY-MM-DD        → int32_t  (days since 2000-01-01)
  * TIME:      HH:MM:SS[.fff]    → int32_t  (milliseconds since midnight)
- * TIMESTAMP: YYYY-MM-DD{T| }HH:MM:SS[.ffffff] → int64_t (µs since epoch)
+ * TIMESTAMP: YYYY-MM-DD{T| }HH:MM:SS[.ffffff] → int64_t (µs since 2000-01-01)
  *
  * Uses Howard Hinnant's civil-calendar algorithm (public domain) for the
  * date→days conversion — O(1), no tables, no branches.
@@ -664,7 +664,7 @@ TD_INLINE int32_t civil_to_days(int y, int m, int d) {
     int yoe = y - era * 400;
     int doy = (153 * m + 2) / 5 + d - 1;
     int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return (int32_t)(era * 146097 + doe - 719468);
+    return (int32_t)(era * 146097 + doe - 719468 - 10957);
 }
 
 TD_INLINE int32_t fast_date(const char* p, size_t len) {
@@ -1510,10 +1510,10 @@ td_err_t td_write_csv(td_t* table, const char* path) {
             }
             case TD_DATE: {
                 int32_t v = ((const int32_t*)td_data(col))[r];
-                /* days since epoch → YYYY-MM-DD */
+                /* days since 2000-01-01 → YYYY-MM-DD */
                 int32_t y, m, d;
                 { /* civil_from_days: algorithm from Howard Hinnant */
-                    int32_t z = v + 719468;
+                    int32_t z = v + 10957 + 719468;
                     int32_t era = (z >= 0 ? z : z - 146096) / 146097;
                     uint32_t doe = (uint32_t)(z - era * 146097);
                     uint32_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
@@ -1543,10 +1543,10 @@ td_err_t td_write_csv(td_t* table, const char* path) {
                 int32_t days = (int32_t)(us / 86400000000LL);
                 int64_t time_us = us % 86400000000LL;
                 if (time_us < 0) { days--; time_us += 86400000000LL; }
-                /* days → YYYY-MM-DD */
+                /* days since 2000-01-01 → YYYY-MM-DD */
                 int32_t y, mo, d;
                 {
-                    int32_t z = days + 719468;
+                    int32_t z = days + 10957 + 719468;
                     int32_t era = (z >= 0 ? z : z - 146096) / 146097;
                     uint32_t doe = (uint32_t)(z - era * 146097);
                     uint32_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
