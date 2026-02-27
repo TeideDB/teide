@@ -650,7 +650,7 @@ strtod_fallback:
  * Fast inline date/time parsers
  *
  * DATE:      YYYY-MM-DD        → int32_t  (days since 1970-01-01)
- * TIME:      HH:MM:SS[.ffffff] → int64_t  (microseconds since midnight)
+ * TIME:      HH:MM:SS[.fff]    → int32_t  (milliseconds since midnight)
  * TIMESTAMP: YYYY-MM-DD{T| }HH:MM:SS[.ffffff] → int64_t (µs since epoch)
  *
  * Uses Howard Hinnant's civil-calendar algorithm (public domain) for the
@@ -676,7 +676,30 @@ TD_INLINE int32_t fast_date(const char* p, size_t len) {
     return civil_to_days(y, m, d);
 }
 
-TD_INLINE int64_t fast_time(const char* p, size_t len) {
+/* TIME → int32_t milliseconds since midnight (kdb+ convention) */
+TD_INLINE int32_t fast_time(const char* p, size_t len) {
+    if (TD_UNLIKELY(len < 8)) return 0;
+    int h  = (p[0]-'0')*10 + (p[1]-'0');
+    int mi = (p[3]-'0')*10 + (p[4]-'0');
+    int s  = (p[6]-'0')*10 + (p[7]-'0');
+    if (TD_UNLIKELY(h > 23 || mi > 59 || s > 59)) return 0;
+    int32_t ms = h * 3600000 + mi * 60000 + s * 1000;
+    /* Fractional seconds → milliseconds */
+    if (len > 8 && p[8] == '.') {
+        int frac = 0, digits = 0;
+        for (size_t i = 9; i < len && digits < 3; i++, digits++) {
+            unsigned di = (unsigned char)p[i] - '0';
+            if (di > 9) break;
+            frac = frac * 10 + (int)di;
+        }
+        while (digits < 3) { frac *= 10; digits++; }
+        ms += (int32_t)frac;
+    }
+    return ms;
+}
+
+/* Timestamp time component → int64_t microseconds (higher precision) */
+TD_INLINE int64_t fast_time_us(const char* p, size_t len) {
     if (TD_UNLIKELY(len < 8)) return 0;
     int h  = (p[0]-'0')*10 + (p[1]-'0');
     int mi = (p[3]-'0')*10 + (p[4]-'0');
@@ -684,7 +707,6 @@ TD_INLINE int64_t fast_time(const char* p, size_t len) {
     if (TD_UNLIKELY(h > 23 || mi > 59 || s > 59)) return 0;
     int64_t us = (int64_t)h * 3600000000LL + (int64_t)mi * 60000000LL +
                  (int64_t)s * 1000000LL;
-    /* Fractional seconds → microseconds */
     if (len > 8 && p[8] == '.') {
         int frac = 0, digits = 0;
         for (size_t i = 9; i < len && digits < 6; i++, digits++) {
@@ -701,7 +723,7 @@ TD_INLINE int64_t fast_time(const char* p, size_t len) {
 TD_INLINE int64_t fast_timestamp(const char* p, size_t len) {
     if (TD_UNLIKELY(len < 19)) return 0;
     int32_t days = fast_date(p, 10);
-    int64_t time_us = fast_time(p + 11, len - 11);
+    int64_t time_us = fast_time_us(p + 11, len - 11);
     return (int64_t)days * 86400000000LL + time_us;
 }
 
@@ -942,7 +964,8 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                         case CSV_TYPE_I64:  ((int64_t*)ctx->col_data[c])[row] = 0; break;
                         case CSV_TYPE_F64:  ((double*)ctx->col_data[c])[row] = 0.0; break;
                         case CSV_TYPE_DATE: ((int32_t*)ctx->col_data[c])[row] = 0; break;
-                        case CSV_TYPE_TIME: case CSV_TYPE_TIMESTAMP:
+                        case CSV_TYPE_TIME: ((int32_t*)ctx->col_data[c])[row] = 0; break;
+                        case CSV_TYPE_TIMESTAMP:
                             ((int64_t*)ctx->col_data[c])[row] = 0; break;
                         case CSV_TYPE_STR:  ((uint32_t*)ctx->col_data[c])[row] = 0; break;
                         default: break;
@@ -976,7 +999,7 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                     ((int32_t*)ctx->col_data[c])[row] = fast_date(fld, flen);
                     break;
                 case CSV_TYPE_TIME:
-                    ((int64_t*)ctx->col_data[c])[row] = fast_time(fld, flen);
+                    ((int32_t*)ctx->col_data[c])[row] = fast_time(fld, flen);
                     break;
                 case CSV_TYPE_TIMESTAMP:
                     ((int64_t*)ctx->col_data[c])[row] = fast_timestamp(fld, flen);
@@ -1021,7 +1044,8 @@ static void csv_parse_serial(const char* buf, size_t buf_size,
                         case CSV_TYPE_I64:  ((int64_t*)col_data[c])[row] = 0; break;
                         case CSV_TYPE_F64:  ((double*)col_data[c])[row] = 0.0; break;
                         case CSV_TYPE_DATE: ((int32_t*)col_data[c])[row] = 0; break;
-                        case CSV_TYPE_TIME: case CSV_TYPE_TIMESTAMP:
+                        case CSV_TYPE_TIME: ((int32_t*)col_data[c])[row] = 0; break;
+                        case CSV_TYPE_TIMESTAMP:
                             ((int64_t*)col_data[c])[row] = 0; break;
                         case CSV_TYPE_STR:  ((uint32_t*)col_data[c])[row] = 0; break;
                         default: break;
@@ -1055,7 +1079,7 @@ static void csv_parse_serial(const char* buf, size_t buf_size,
                     ((int32_t*)col_data[c])[row] = fast_date(fld, flen);
                     break;
                 case CSV_TYPE_TIME:
-                    ((int64_t*)col_data[c])[row] = fast_time(fld, flen);
+                    ((int32_t*)col_data[c])[row] = fast_time(fld, flen);
                     break;
                 case CSV_TYPE_TIMESTAMP:
                     ((int64_t*)col_data[c])[row] = fast_timestamp(fld, flen);
