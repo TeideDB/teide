@@ -138,7 +138,13 @@ td_t* td_sym(int64_t id) {
 }
 
 /* --------------------------------------------------------------------------
- * Date/Time/Timestamp atoms: i64 value
+ * Date/Time/Timestamp atoms
+ *
+ * All atom constructors accept int64_t and store in the i64 union field
+ * (atoms are scalar wrappers — always 8 bytes in the union). The vector
+ * element sizes differ: DATE=4, TIME=4, TIMESTAMP=8. When broadcasting
+ * an atom to a vector (materialize_broadcast_input), the value must be
+ * narrowed to the correct element width.
  * -------------------------------------------------------------------------- */
 
 td_t* td_date(int64_t val) {

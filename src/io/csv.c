@@ -1508,6 +1508,69 @@ td_err_t td_write_csv(td_t* table, const char* path) {
                 else fprintf(fp, "%u", (unsigned)v);
                 break;
             }
+            case TD_DATE: {
+                int32_t v = ((const int32_t*)td_data(col))[r];
+                /* days since epoch → YYYY-MM-DD */
+                int32_t y, m, d;
+                { /* civil_from_days: algorithm from Howard Hinnant */
+                    int32_t z = v + 719468;
+                    int32_t era = (z >= 0 ? z : z - 146096) / 146097;
+                    uint32_t doe = (uint32_t)(z - era * 146097);
+                    uint32_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+                    y = (int32_t)yoe + era * 400;
+                    uint32_t doy = doe - (365*yoe + yoe/4 - yoe/100);
+                    uint32_t mp = (5*doy + 2) / 153;
+                    d = (int32_t)(doy - (153*mp + 2)/5 + 1);
+                    m = (int32_t)(mp < 10 ? mp + 3 : mp - 9);
+                    if (m <= 2) y++;
+                }
+                fprintf(fp, "%04d-%02d-%02d", y, m, d);
+                break;
+            }
+            case TD_TIME: {
+                int32_t ms = ((const int32_t*)td_data(col))[r];
+                uint32_t ums = (uint32_t)ms;
+                uint32_t h = ums / 3600000;
+                uint32_t mi = (ums % 3600000) / 60000;
+                uint32_t s = (ums % 60000) / 1000;
+                uint32_t frac = ums % 1000;
+                if (frac) fprintf(fp, "%02u:%02u:%02u.%03u", h, mi, s, frac);
+                else      fprintf(fp, "%02u:%02u:%02u", h, mi, s);
+                break;
+            }
+            case TD_TIMESTAMP: {
+                int64_t us = ((const int64_t*)td_data(col))[r];
+                int32_t days = (int32_t)(us / 86400000000LL);
+                int64_t time_us = us % 86400000000LL;
+                if (time_us < 0) { days--; time_us += 86400000000LL; }
+                /* days → YYYY-MM-DD */
+                int32_t y, mo, d;
+                {
+                    int32_t z = days + 719468;
+                    int32_t era = (z >= 0 ? z : z - 146096) / 146097;
+                    uint32_t doe = (uint32_t)(z - era * 146097);
+                    uint32_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+                    y = (int32_t)yoe + era * 400;
+                    uint32_t doy = doe - (365*yoe + yoe/4 - yoe/100);
+                    uint32_t mp = (5*doy + 2) / 153;
+                    d = (int32_t)(doy - (153*mp + 2)/5 + 1);
+                    mo = (int32_t)(mp < 10 ? mp + 3 : mp - 9);
+                    if (mo <= 2) y++;
+                }
+                uint64_t tus = (uint64_t)time_us;
+                uint32_t h = (uint32_t)(tus / 3600000000ULL);
+                uint32_t mi = (uint32_t)((tus % 3600000000ULL) / 60000000ULL);
+                uint32_t s = (uint32_t)((tus % 60000000ULL) / 1000000ULL);
+                uint32_t frac = (uint32_t)(tus % 1000000ULL);
+                if (frac) fprintf(fp, "%04d-%02d-%02dT%02u:%02u:%02u.%06u", y, mo, d, h, mi, s, frac);
+                else      fprintf(fp, "%04d-%02d-%02dT%02u:%02u:%02u", y, mo, d, h, mi, s);
+                break;
+            }
+            case TD_I16: {
+                int16_t v = ((const int16_t*)td_data(col))[r];
+                fprintf(fp, "%d", (int)v);
+                break;
+            }
             case TD_SYM: {
                 int64_t sym = td_read_sym(td_data(col), r, col->type, col->attrs);
                 td_t* s = td_sym_str(sym);

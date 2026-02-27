@@ -4780,13 +4780,13 @@ static td_t* materialize_broadcast_input(td_t* src, int64_t nrows) {
         }
         case TD_ATOM_I64:
         case TD_ATOM_SYM:
-        case TD_ATOM_TIME:
         case TD_ATOM_TIMESTAMP: {
             int64_t v = src->i64;
             for (int64_t i = 0; i < nrows; i++) ((int64_t*)td_data(out))[i] = v;
             return out;
         }
-        case TD_ATOM_DATE: {
+        case TD_ATOM_DATE:
+        case TD_ATOM_TIME: {
             int32_t v = (int32_t)src->i64;
             for (int64_t i = 0; i < nrows; i++) ((int32_t*)td_data(out))[i] = v;
             return out;
