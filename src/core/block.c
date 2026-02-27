@@ -52,10 +52,11 @@ size_t td_block_size(td_t* v) {
         dsz += (size_t)n_words * 8;                   /* bits */
         return 32 + dsz;
     }
-    /* Vectors: header (32 bytes) + len * elem_size */
+    /* Vectors: header (32 bytes) + len * elem_size.
+     * Use td_sym_elem_size for SYM columns to respect narrow widths. */
     int8_t t = td_type(v);
     if (t <= 0 || t >= TD_TYPE_COUNT) return 32;
-    return 32 + (size_t)td_len(v) * td_elem_size(t);
+    return 32 + (size_t)td_len(v) * td_sym_elem_size(t, v->attrs);
 }
 
 td_t* td_block_copy(td_t* src) {
