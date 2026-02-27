@@ -36,7 +36,7 @@ void td_morsel_init(td_morsel_t* m, td_t* vec) {
     m->vec = vec;
     m->offset = 0;
     m->len = td_len(vec);
-    m->elem_size = td_elem_size(vec->type);
+    m->elem_size = td_sym_elem_size(vec->type, vec->attrs);
     m->morsel_len = 0;
     m->morsel_ptr = NULL;
     m->null_bits = NULL;
@@ -96,7 +96,7 @@ void td_morsel_init_range(td_morsel_t* m, td_t* vec, int64_t start, int64_t end)
     m->vec = vec;
     m->offset = start;
     m->len = end;
-    m->elem_size = td_elem_size(vec->type);
+    m->elem_size = td_sym_elem_size(vec->type, vec->attrs);
     m->morsel_len = 0;
     m->morsel_ptr = NULL;
     m->null_bits = NULL;
