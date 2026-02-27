@@ -3323,6 +3323,15 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
             g->table = saved;
             sort_owned[k] = 1;
         }
+        if (!sort_vecs[k] || TD_IS_ERR(sort_vecs[k])) {
+            td_t* err = sort_vecs[k] ? sort_vecs[k] : TD_ERR_PTR(TD_ERR_NYI);
+            for (uint8_t j = 0; j < k; j++) {
+                if (sort_owned[j] && sort_vecs[j] && !TD_IS_ERR(sort_vecs[j]))
+                    td_release(sort_vecs[j]);
+            }
+            scratch_free(indices_hdr);
+            return err;
+        }
     }
 
     /* --- Radix sort fast path ------------------------------------------------
@@ -9115,11 +9124,26 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
         sort_vecs[k] = win_resolve_vec(g, ext->window.part_keys[k], tbl,
                                         &sort_owned[k]);
         sort_descs[k] = 0;  /* partition keys always ASC */
+        if (!sort_vecs[k] || TD_IS_ERR(sort_vecs[k])) {
+            td_t* err = sort_vecs[k] ? sort_vecs[k] : TD_ERR_PTR(TD_ERR_NYI);
+            for (uint8_t j = 0; j < k; j++)
+                if (sort_owned[j] && sort_vecs[j] && !TD_IS_ERR(sort_vecs[j]))
+                    td_release(sort_vecs[j]);
+            return err;
+        }
     }
     for (uint8_t k = 0; k < n_order; k++) {
         sort_vecs[n_part + k] = win_resolve_vec(g, ext->window.order_keys[k],
                                                  tbl, &sort_owned[n_part + k]);
         sort_descs[n_part + k] = ext->window.order_descs[k];
+        if (!sort_vecs[n_part + k] || TD_IS_ERR(sort_vecs[n_part + k])) {
+            td_t* err = sort_vecs[n_part + k] ? sort_vecs[n_part + k]
+                                               : TD_ERR_PTR(TD_ERR_NYI);
+            for (uint8_t j = 0; j < n_part + k; j++)
+                if (sort_owned[j] && sort_vecs[j] && !TD_IS_ERR(sort_vecs[j]))
+                    td_release(sort_vecs[j]);
+            return err;
+        }
     }
 
     td_t* func_vecs[n_funcs];
@@ -9130,10 +9154,21 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
     memset(result_vecs, 0, sizeof(result_vecs));
     for (uint8_t f = 0; f < n_funcs; f++) {
         td_op_t* fi = ext->window.func_inputs[f];
-        if (fi)
+        if (fi) {
             func_vecs[f] = win_resolve_vec(g, fi, tbl, &func_owned[f]);
-        else
+            if (!func_vecs[f] || TD_IS_ERR(func_vecs[f])) {
+                td_t* err = func_vecs[f] ? func_vecs[f] : TD_ERR_PTR(TD_ERR_NYI);
+                for (uint8_t j = 0; j < f; j++)
+                    if (func_owned[j] && func_vecs[j] && !TD_IS_ERR(func_vecs[j]))
+                        td_release(func_vecs[j]);
+                for (uint8_t j = 0; j < n_sort; j++)
+                    if (sort_owned[j] && sort_vecs[j] && !TD_IS_ERR(sort_vecs[j]))
+                        td_release(sort_vecs[j]);
+                return err;
+            }
+        } else {
             func_vecs[f] = NULL;
+        }
     }
 
     /* --- Phase 1: Sort by (partition_keys ++ order_keys) --- */
