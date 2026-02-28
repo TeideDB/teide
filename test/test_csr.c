@@ -550,6 +550,135 @@ static MunitResult test_expand_factorized(const void* params, void* data) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test: SIP expand (source-side selection skip)
+ * -------------------------------------------------------------------------- */
+
+static MunitResult test_sip_expand(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    td_t* edges = make_edge_table();
+    td_rel_t* rel = td_rel_from_edges(edges, "src", "dst", 4, 4, false);
+    munit_assert_ptr_not_null(rel);
+
+    /* Create source-side selection: only allow node 0 (skip nodes 1, 2, 3) */
+    td_t* src_sel = td_sel_new(4);
+    munit_assert_ptr_not_null(src_sel);
+    munit_assert_false(TD_IS_ERR(src_sel));
+    uint64_t* sel_bits = td_sel_bits(src_sel);
+    TD_SEL_BIT_SET(sel_bits, 0);  /* only node 0 passes */
+
+    /* Expand from nodes {0, 1, 2} forward — but SIP should skip 1, 2 */
+    int64_t start_data[] = {0, 1, 2};
+    td_t* start_vec = td_vec_from_raw(TD_I64, start_data, 3);
+
+    td_graph_t* g = td_graph_new(NULL);
+
+    td_op_t* src = td_const_vec(g, start_vec);
+    td_op_t* expand = td_expand(g, src, rel, 0);
+
+    /* Attach SIP selection to the expand ext node */
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == expand->id) {
+            g->ext_nodes[i]->graph.sip_sel = src_sel;
+            break;
+        }
+    }
+
+    td_t* result = td_execute(g, expand);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->type, ==, TD_TABLE);
+
+    /* Only node 0 should be expanded: degree 2 → 2 output rows */
+    munit_assert(td_table_nrows(result) == 2);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(src_sel);
+    td_release(start_vec);
+    td_rel_free(rel);
+    td_release(edges);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* --------------------------------------------------------------------------
+ * Test: S-Join semijoin filter in exec_join
+ * -------------------------------------------------------------------------- */
+
+static MunitResult test_sjoin_filter(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    /* Left table: id column with many rows, most not in right side */
+    int64_t n_left = 100;
+    td_t* left_ids = td_vec_new(TD_I64, n_left);
+    munit_assert_ptr_not_null(left_ids);
+    munit_assert_false(TD_IS_ERR(left_ids));
+    left_ids->len = n_left;
+    int64_t* lid = (int64_t*)td_data(left_ids);
+    for (int64_t i = 0; i < n_left; i++) lid[i] = i;
+
+    td_t* left_vals = td_vec_new(TD_I64, n_left);
+    left_vals->len = n_left;
+    int64_t* lv = (int64_t*)td_data(left_vals);
+    for (int64_t i = 0; i < n_left; i++) lv[i] = i * 10;
+
+    int64_t id_sym = td_sym_intern("id", 2);
+    int64_t val_sym = td_sym_intern("val", 3);
+    td_t* left_tbl = td_table_new(2);
+    left_tbl = td_table_add_col(left_tbl, id_sym, left_ids);
+    left_tbl = td_table_add_col(left_tbl, val_sym, left_vals);
+    td_release(left_ids); td_release(left_vals);
+
+    /* Right table: small, only ids 5, 10, 15 */
+    int64_t rids[] = {5, 10, 15};
+    td_t* right_ids = td_vec_from_raw(TD_I64, rids, 3);
+    int64_t rvals[] = {500, 1000, 1500};
+    td_t* right_vals = td_vec_from_raw(TD_I64, rvals, 3);
+
+    int64_t rval_sym = td_sym_intern("rval", 4);
+    td_t* right_tbl = td_table_new(2);
+    right_tbl = td_table_add_col(right_tbl, id_sym, right_ids);
+    right_tbl = td_table_add_col(right_tbl, rval_sym, right_vals);
+    td_release(right_ids); td_release(right_vals);
+
+    /* Inner join on id — should trigger S-Join (100 > 3*2) */
+    td_graph_t* g = td_graph_new(left_tbl);
+    uint16_t right_id = td_graph_add_table(g, right_tbl);
+
+    /* Build join: table-producing ops for left/right, key scans for join keys */
+    td_op_t* left_tbl_op  = td_const_table(g, left_tbl);
+    td_op_t* right_tbl_op = td_const_table(g, right_tbl);
+    td_op_t* left_scan    = td_scan(g, "id");
+    td_op_t* right_scan   = td_scan_table(g, right_id, "id");
+
+    td_op_t* left_keys[1]  = { left_scan };
+    td_op_t* right_keys[1] = { right_scan };
+
+    td_op_t* join = td_join(g, left_tbl_op, left_keys, right_tbl_op, right_keys, 1, 0);
+    munit_assert_ptr_not_null(join);
+
+    td_t* result = td_execute(g, join);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->type, ==, TD_TABLE);
+
+    /* Should match exactly 3 rows (ids 5, 10, 15) */
+    munit_assert(td_table_nrows(result) == 3);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(left_tbl);
+    td_release(right_tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* --------------------------------------------------------------------------
  * Suite definition
  * -------------------------------------------------------------------------- */
 
@@ -564,6 +693,8 @@ static MunitTest csr_tests[] = {
     { "/wco_join",         test_wco_join_triangle,     NULL, NULL, 0, NULL },
     { "/wco_chain",        test_wco_join_chain,        NULL, NULL, 0, NULL },
     { "/factorized",       test_expand_factorized,     NULL, NULL, 0, NULL },
+    { "/sip_expand",       test_sip_expand,            NULL, NULL, 0, NULL },
+    { "/sjoin",            test_sjoin_filter,           NULL, NULL, 0, NULL },
     { "/multi_table",      test_multi_table,           NULL, NULL, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL },  /* terminator */
 };

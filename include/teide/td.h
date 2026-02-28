@@ -489,6 +489,7 @@ typedef struct td_op_ext {
         } window;
         struct {  /* OP_EXPAND / OP_VAR_EXPAND / OP_SHORTEST_PATH */
             void*     rel;            /* td_rel_t* (opaque to public header) */
+            void*     sip_sel;        /* td_t* TD_SEL bitmap for SIP source-side skip */
             uint8_t   direction;      /* 0=fwd, 1=rev, 2=both */
             uint8_t   min_depth;
             uint8_t   max_depth;

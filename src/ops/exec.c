@@ -7370,6 +7370,9 @@ typedef struct {
     int64_t*     r_idx;
     /* FULL OUTER: track which right rows were matched (NULL if not full) */
     _Atomic(uint8_t)* matched_right;
+    /* S-Join: semijoin filter bitmap (NULL if not applicable) */
+    uint64_t*    sjoin_bits;
+    int64_t      sjoin_key_max;
 } join_probe_ctx_t;
 
 /* Phase 2a: count matches per morsel */
@@ -7381,9 +7384,21 @@ static void join_count_fn(void* raw, uint32_t wid, int64_t task_start, int64_t t
     int64_t row_end = row_start + JOIN_MORSEL;
     if (row_end > c->left_rows) row_end = c->left_rows;
 
+    /* S-Join: precompute pointer for fast semijoin check */
+    uint64_t* sjbits = c->sjoin_bits;
+    int64_t sjmax = c->sjoin_key_max;
+    int64_t* lk0 = (sjbits && c->n_keys == 1) ? (int64_t*)td_data(c->l_key_vecs[0]) : NULL;
+
     int64_t count = 0;
     uint32_t ht_mask = c->ht_cap - 1;
     for (int64_t l = row_start; l < row_end; l++) {
+        /* S-Join skip: if left key not in right-side bitmap, skip probe */
+        if (lk0 && lk0[l] >= 0 && lk0[l] <= sjmax &&
+            !TD_SEL_BIT_TEST(sjbits, lk0[l])) {
+            if (c->join_type >= 1) count++;  /* LEFT/FULL: emit unmatched */
+            continue;
+        }
+
         if (l + 8 < row_end) {
             uint64_t pf_h = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8);
             __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
@@ -7415,8 +7430,24 @@ static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t ta
     int64_t* restrict li = c->l_idx;
     int64_t* restrict ri = c->r_idx;
 
+    /* S-Join: precompute pointer for fast semijoin check */
+    uint64_t* sjbits = c->sjoin_bits;
+    int64_t sjmax = c->sjoin_key_max;
+    int64_t* lk0 = (sjbits && c->n_keys == 1) ? (int64_t*)td_data(c->l_key_vecs[0]) : NULL;
+
     uint32_t ht_mask = c->ht_cap - 1;
     for (int64_t l = row_start; l < row_end; l++) {
+        /* S-Join skip: if left key not in right-side bitmap, skip probe */
+        if (lk0 && lk0[l] >= 0 && lk0[l] <= sjmax &&
+            !TD_SEL_BIT_TEST(sjbits, lk0[l])) {
+            if (c->join_type >= 1) {
+                li[off] = l;
+                ri[off] = -1;
+                off++;
+            }
+            continue;
+        }
+
         if (l + 8 < row_end) {
             uint64_t pf_h = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8);
             __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
@@ -7533,7 +7564,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
         if (key_max < (int64_t)1 << 24) {  /* only for reasonably bounded keys */
             sjoin_sel = td_sel_new(key_max + 1);
             if (sjoin_sel && !TD_IS_ERR(sjoin_sel)) {
-                uint64_t* bits = (uint64_t*)td_data(sjoin_sel);
+                uint64_t* bits = td_sel_bits(sjoin_sel);
                 for (int64_t i = 0; i < right_rows; i++) {
                     int64_t k = rk[i];
                     if (k >= 0 && k <= key_max)
@@ -7562,6 +7593,14 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
         if (!matched_right) goto join_cleanup;
     }
 
+    /* Prepare S-Join fields for probe context */
+    uint64_t* sjoin_bits = NULL;
+    int64_t sjoin_key_max = 0;
+    if (sjoin_sel && !TD_IS_ERR(sjoin_sel)) {
+        sjoin_bits = td_sel_bits(sjoin_sel);
+        sjoin_key_max = sjoin_sel->len - 1;
+    }
+
     join_probe_ctx_t probe_ctx = {
         .ht_heads    = ht_heads,
         .ht_next     = ht_next,
@@ -7573,6 +7612,8 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
         .left_rows   = left_rows,
         .morsel_counts = morsel_counts,
         .matched_right = matched_right,
+        .sjoin_bits  = sjoin_bits,
+        .sjoin_key_max = sjoin_key_max,
     };
 
     /* 2a: Count matches per morsel */
@@ -9750,6 +9791,16 @@ static td_t* exec_expand(td_graph_t* g, td_op_t* op, td_t* src_vec) {
     int64_t n_src = src_vec->len;
     int64_t* src_data = (int64_t*)td_data(src_vec);
 
+    /* SIP runtime: check for source-side selection bitmap stored on the
+     * expand ext node (set by optimizer sip_pass or manually for testing). */
+    uint64_t* src_sel_bits = NULL;
+    int64_t src_sel_len = 0;
+    td_t* sip_sel = (td_t*)ext->graph.sip_sel;
+    if (sip_sel && !TD_IS_ERR(sip_sel) && sip_sel->type == TD_SEL) {
+        src_sel_bits = td_sel_bits(sip_sel);
+        src_sel_len = sip_sel->len;
+    }
+
     /* Helper to expand one CSR direction */
     #define EXPAND_DIR(csr_ptr) do { \
         td_csr_t* csr = (csr_ptr); \
@@ -9757,6 +9808,9 @@ static td_t* exec_expand(td_graph_t* g, td_op_t* op, td_t* src_vec) {
         int64_t total = 0; \
         for (int64_t i = 0; i < n_src; i++) { \
             int64_t node = src_data[i]; \
+            /* SIP skip: if source node not in selection, skip */ \
+            if (src_sel_bits && node >= 0 && node < src_sel_len \
+                && !TD_SEL_BIT_TEST(src_sel_bits, node)) continue; \
             if (node >= 0 && node < csr->n_nodes) \
                 total += td_csr_degree(csr, node); \
         } \
@@ -9775,6 +9829,9 @@ static td_t* exec_expand(td_graph_t* g, td_op_t* op, td_t* src_vec) {
         for (int64_t i = 0; i < n_src; i++) { \
             int64_t node = src_data[i]; \
             if (node < 0 || node >= csr->n_nodes) continue; \
+            /* SIP skip: must match count phase */ \
+            if (src_sel_bits && node < src_sel_len \
+                && !TD_SEL_BIT_TEST(src_sel_bits, node)) continue; \
             int64_t cnt; \
             int64_t* nbrs = td_csr_neighbors(csr, node, &cnt); \
             for (int64_t j = 0; j < cnt; j++) { \
@@ -9810,6 +9867,8 @@ static td_t* exec_expand(td_graph_t* g, td_op_t* op, td_t* src_vec) {
         int64_t fwd_total = 0;
         for (int64_t i = 0; i < n_src; i++) {
             int64_t node = src_data[i];
+            if (src_sel_bits && node >= 0 && node < src_sel_len
+                && !TD_SEL_BIT_TEST(src_sel_bits, node)) continue;
             if (node >= 0 && node < fwd->n_nodes)
                 fwd_total += td_csr_degree(fwd, node);
         }
@@ -9817,6 +9876,8 @@ static td_t* exec_expand(td_graph_t* g, td_op_t* op, td_t* src_vec) {
         int64_t rev_total = 0;
         for (int64_t i = 0; i < n_src; i++) {
             int64_t node = src_data[i];
+            if (src_sel_bits && node >= 0 && node < src_sel_len
+                && !TD_SEL_BIT_TEST(src_sel_bits, node)) continue;
             if (node >= 0 && node < rev->n_nodes)
                 rev_total += td_csr_degree(rev, node);
         }
@@ -9838,6 +9899,8 @@ static td_t* exec_expand(td_graph_t* g, td_op_t* op, td_t* src_vec) {
         for (int64_t i = 0; i < n_src; i++) {
             int64_t node = src_data[i];
             if (node < 0 || node >= fwd->n_nodes) continue;
+            if (src_sel_bits && node < src_sel_len
+                && !TD_SEL_BIT_TEST(src_sel_bits, node)) continue;
             int64_t cnt;
             int64_t* nbrs = td_csr_neighbors(fwd, node, &cnt);
             for (int64_t j = 0; j < cnt; j++) {
@@ -9848,6 +9911,8 @@ static td_t* exec_expand(td_graph_t* g, td_op_t* op, td_t* src_vec) {
         for (int64_t i = 0; i < n_src; i++) {
             int64_t node = src_data[i];
             if (node < 0 || node >= rev->n_nodes) continue;
+            if (src_sel_bits && node < src_sel_len
+                && !TD_SEL_BIT_TEST(src_sel_bits, node)) continue;
             int64_t cnt;
             int64_t* nbrs = td_csr_neighbors(rev, node, &cnt);
             for (int64_t j = 0; j < cnt; j++) {
