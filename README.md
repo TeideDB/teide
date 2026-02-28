@@ -1,6 +1,6 @@
 # Teide
 
-Pure C17 zero-dependency columnar dataframe engine with lazy fusion execution.
+Pure C17 zero-dependency columnar dataframe engine with native graph processing. Lazy fusion execution, CSR edge indices, worst-case optimal joins, and sideways information passing — all in the same morsel-driven pipeline.
 
 ## Features
 
@@ -8,6 +8,10 @@ Pure C17 zero-dependency columnar dataframe engine with lazy fusion execution.
 - **Buddy allocator** with thread-local arenas, slab cache, COW ref counting
 - **Lazy DAG execution** — build operation graph → optimize → fused morsel-driven execution
 - **Parallel execution** — morsel-driven thread pool, radix-partitioned hash tables
+- **Graph engine** — CSR storage (forward + reverse), 1-hop expand, BFS traversal, shortest path
+- **Worst-case optimal joins** — Leapfrog Triejoin for cyclic patterns (triangles, k-cliques)
+- **Factorized execution** — `td_fvec_t` / `td_ftable_t` avoid materializing cross-products
+- **SIP optimizer** — sideways information passing propagates selection bitmaps backward through expand chains
 - **Zero external dependencies** — pure C17, single public header
 
 ## Build
