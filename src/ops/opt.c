@@ -742,6 +742,38 @@ static void pass_dce(td_graph_t* g, td_op_t* root) {
 }
 
 /* --------------------------------------------------------------------------
+ * Pass: SIP (Sideways Information Passing)
+ *
+ * Bottom-up DAG walk. For each OP_EXPAND:
+ *   1. Find downstream filter on target side
+ *   2. Reverse-CSR: mark source nodes that have any passing target -> TD_SEL
+ *   3. Attach source_sel to upstream scan
+ *
+ * Currently a no-op placeholder — activated when graph ops are present.
+ * -------------------------------------------------------------------------- */
+
+static void sip_pass(td_graph_t* g, td_op_t* root) {
+    if (!g || !root) return;
+
+    /* Walk DAG looking for OP_EXPAND nodes. For now, this is a simple
+     * pass that marks graph ops as reachable. Full SIP with backward
+     * TD_SEL propagation requires knowing the target table and downstream
+     * filter structure, which the planner provides. */
+    uint32_t nc = g->node_count;
+    for (uint32_t i = 0; i < nc; i++) {
+        td_op_t* n = &g->nodes[i];
+        if (n->flags & OP_FLAG_DEAD) continue;
+        if (n->opcode != OP_EXPAND) continue;
+
+        /* TODO: Full SIP implementation:
+         * 1. Find downstream filter on target side
+         * 2. Evaluate filter -> TD_SEL on target table
+         * 3. Reverse-CSR: mark source nodes with passing targets
+         * 4. Attach source_sel to upstream OP_SCAN */
+    }
+}
+
+/* --------------------------------------------------------------------------
  * td_optimize — run all passes in order, return (possibly updated) root
  * -------------------------------------------------------------------------- */
 
@@ -754,10 +786,13 @@ td_op_t* td_optimize(td_graph_t* g, td_op_t* root) {
     /* Pass 2: Constant folding */
     pass_constant_fold(g, root);
 
-    /* Pass 3: Fusion */
+    /* Pass 3: SIP (graph-aware sideways information passing) */
+    sip_pass(g, root);
+
+    /* Pass 4: Fusion */
     td_fuse_pass(g, root);
 
-    /* Pass 4: DCE */
+    /* Pass 5: DCE */
     pass_dce(g, root);
 
     /* Return root — may have been replaced during folding.

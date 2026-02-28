@@ -24,9 +24,12 @@
 #include "exec.h"
 #include "hash.h"
 #include "pool.h"
+#include "store/csr.h"
+#include "lftj.h"
 #include "mem/heap.h"
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
 #include <float.h>
 #include <ctype.h>
 
@@ -9644,6 +9647,586 @@ oom:
 }
 
 /* ============================================================================
+ * Graph execution functions
+ * ============================================================================ */
+
+/* exec_expand: 1-hop CSR neighbor expansion.
+ * Count-then-fill pattern (same as exec_join). */
+static td_t* exec_expand(td_graph_t* g, td_op_t* op, td_t* src_vec) {
+    td_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
+
+    td_rel_t* rel = (td_rel_t*)ext->graph.rel;
+    if (!rel) return TD_ERR_PTR(TD_ERR_SCHEMA);
+
+    uint8_t direction = ext->graph.direction;
+    int64_t n_src = src_vec->len;
+    int64_t* src_data = (int64_t*)td_data(src_vec);
+
+    /* Helper to expand one CSR direction */
+    #define EXPAND_DIR(csr_ptr) do { \
+        td_csr_t* csr = (csr_ptr); \
+        /* Phase 1: count total output pairs */ \
+        int64_t total = 0; \
+        for (int64_t i = 0; i < n_src; i++) { \
+            int64_t node = src_data[i]; \
+            if (node >= 0 && node < csr->n_nodes) \
+                total += td_csr_degree(csr, node); \
+        } \
+        /* Phase 2: fill */ \
+        td_t* d_src = td_vec_new(TD_I64, total > 0 ? total : 1); \
+        td_t* d_dst = td_vec_new(TD_I64, total > 0 ? total : 1); \
+        if (!d_src || TD_IS_ERR(d_src) || !d_dst || TD_IS_ERR(d_dst)) { \
+            if (d_src && !TD_IS_ERR(d_src)) td_release(d_src); \
+            if (d_dst && !TD_IS_ERR(d_dst)) td_release(d_dst); \
+            return TD_ERR_PTR(TD_ERR_OOM); \
+        } \
+        d_src->len = total; d_dst->len = total; \
+        int64_t* sd = (int64_t*)td_data(d_src); \
+        int64_t* dd = (int64_t*)td_data(d_dst); \
+        int64_t pos = 0; \
+        for (int64_t i = 0; i < n_src; i++) { \
+            int64_t node = src_data[i]; \
+            if (node < 0 || node >= csr->n_nodes) continue; \
+            int64_t cnt; \
+            int64_t* nbrs = td_csr_neighbors(csr, node, &cnt); \
+            for (int64_t j = 0; j < cnt; j++) { \
+                sd[pos] = node; \
+                dd[pos] = nbrs[j]; \
+                pos++; \
+            } \
+        } \
+        /* Build result table */ \
+        int64_t src_sym = td_sym_intern("_src", 4); \
+        int64_t dst_sym = td_sym_intern("_dst", 4); \
+        td_t* result = td_table_new(2); \
+        if (!result || TD_IS_ERR(result)) { \
+            td_release(d_src); td_release(d_dst); \
+            return TD_ERR_PTR(TD_ERR_OOM); \
+        } \
+        result = td_table_add_col(result, src_sym, d_src); \
+        result = td_table_add_col(result, dst_sym, d_dst); \
+        td_release(d_src); td_release(d_dst); \
+        return result; \
+    } while (0)
+
+    if (direction == 0) {
+        EXPAND_DIR(&rel->fwd);
+    } else if (direction == 1) {
+        EXPAND_DIR(&rel->rev);
+    } else {
+        /* direction == 2: both — expand fwd, then rev, concat */
+        td_csr_t* fwd = &rel->fwd;
+        td_csr_t* rev = &rel->rev;
+
+        /* Count forward */
+        int64_t fwd_total = 0;
+        for (int64_t i = 0; i < n_src; i++) {
+            int64_t node = src_data[i];
+            if (node >= 0 && node < fwd->n_nodes)
+                fwd_total += td_csr_degree(fwd, node);
+        }
+        /* Count reverse */
+        int64_t rev_total = 0;
+        for (int64_t i = 0; i < n_src; i++) {
+            int64_t node = src_data[i];
+            if (node >= 0 && node < rev->n_nodes)
+                rev_total += td_csr_degree(rev, node);
+        }
+
+        int64_t total = fwd_total + rev_total;
+        td_t* d_src = td_vec_new(TD_I64, total > 0 ? total : 1);
+        td_t* d_dst = td_vec_new(TD_I64, total > 0 ? total : 1);
+        if (!d_src || TD_IS_ERR(d_src) || !d_dst || TD_IS_ERR(d_dst)) {
+            if (d_src && !TD_IS_ERR(d_src)) td_release(d_src);
+            if (d_dst && !TD_IS_ERR(d_dst)) td_release(d_dst);
+            return TD_ERR_PTR(TD_ERR_OOM);
+        }
+        d_src->len = total; d_dst->len = total;
+        int64_t* sd = (int64_t*)td_data(d_src);
+        int64_t* dd = (int64_t*)td_data(d_dst);
+        int64_t pos = 0;
+
+        /* Fill forward */
+        for (int64_t i = 0; i < n_src; i++) {
+            int64_t node = src_data[i];
+            if (node < 0 || node >= fwd->n_nodes) continue;
+            int64_t cnt;
+            int64_t* nbrs = td_csr_neighbors(fwd, node, &cnt);
+            for (int64_t j = 0; j < cnt; j++) {
+                sd[pos] = node; dd[pos] = nbrs[j]; pos++;
+            }
+        }
+        /* Fill reverse */
+        for (int64_t i = 0; i < n_src; i++) {
+            int64_t node = src_data[i];
+            if (node < 0 || node >= rev->n_nodes) continue;
+            int64_t cnt;
+            int64_t* nbrs = td_csr_neighbors(rev, node, &cnt);
+            for (int64_t j = 0; j < cnt; j++) {
+                sd[pos] = node; dd[pos] = nbrs[j]; pos++;
+            }
+        }
+
+        int64_t src_sym = td_sym_intern("_src", 4);
+        int64_t dst_sym = td_sym_intern("_dst", 4);
+        td_t* result = td_table_new(2);
+        if (!result || TD_IS_ERR(result)) {
+            td_release(d_src); td_release(d_dst);
+            return TD_ERR_PTR(TD_ERR_OOM);
+        }
+        result = td_table_add_col(result, src_sym, d_src);
+        result = td_table_add_col(result, dst_sym, d_dst);
+        td_release(d_src); td_release(d_dst);
+        return result;
+    }
+    #undef EXPAND_DIR
+}
+
+/* exec_var_expand: iterative BFS with depth limit and cycle detection */
+static td_t* exec_var_expand(td_graph_t* g, td_op_t* op, td_t* start_vec) {
+    td_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
+
+    td_rel_t* rel = (td_rel_t*)ext->graph.rel;
+    if (!rel) return TD_ERR_PTR(TD_ERR_SCHEMA);
+
+    uint8_t direction = ext->graph.direction;
+    uint8_t min_depth = ext->graph.min_depth;
+    uint8_t max_depth = ext->graph.max_depth;
+    td_csr_t* csr = (direction == 1) ? &rel->rev : &rel->fwd;
+
+    int64_t n_start = start_vec->len;
+    int64_t* start_data = (int64_t*)td_data(start_vec);
+
+    /* Pre-allocate output buffers (grow as needed) */
+    int64_t out_cap = 1024;
+    td_t *start_hdr, *end_hdr, *depth_hdr;
+    int64_t* out_start = (int64_t*)scratch_alloc(&start_hdr, (size_t)out_cap * sizeof(int64_t));
+    int64_t* out_end   = (int64_t*)scratch_alloc(&end_hdr,   (size_t)out_cap * sizeof(int64_t));
+    int64_t* out_depth = (int64_t*)scratch_alloc(&depth_hdr, (size_t)out_cap * sizeof(int64_t));
+    if (!out_start || !out_end || !out_depth) {
+        scratch_free(start_hdr); scratch_free(end_hdr); scratch_free(depth_hdr);
+        return TD_ERR_PTR(TD_ERR_OOM);
+    }
+    int64_t out_count = 0;
+
+    /* BFS per start node */
+    for (int64_t s = 0; s < n_start; s++) {
+        int64_t start_node = start_data[s];
+        if (start_node < 0 || start_node >= csr->n_nodes) continue;
+
+        /* Visited bitmap via TD_SEL */
+        td_t* visited_sel = td_sel_new(csr->n_nodes);
+        if (!visited_sel || TD_IS_ERR(visited_sel)) continue;
+        uint64_t* visited = td_sel_bits(visited_sel);
+        TD_SEL_BIT_SET(visited, start_node);
+
+        /* Frontier */
+        td_t* front_hdr;
+        int64_t front_cap = 256;
+        int64_t* frontier = (int64_t*)scratch_alloc(&front_hdr, (size_t)front_cap * sizeof(int64_t));
+        if (!frontier) { td_release(visited_sel); continue; }
+        frontier[0] = start_node;
+        int64_t front_len = 1;
+
+        for (uint8_t depth = 1; depth <= max_depth && front_len > 0; depth++) {
+            td_t* next_hdr;
+            int64_t next_cap = front_len * 4;
+            if (next_cap < 64) next_cap = 64;
+            int64_t* next_front = (int64_t*)scratch_alloc(&next_hdr, (size_t)next_cap * sizeof(int64_t));
+            if (!next_front) { scratch_free(front_hdr); td_release(visited_sel); goto cleanup; }
+            int64_t next_len = 0;
+
+            for (int64_t f = 0; f < front_len; f++) {
+                int64_t node = frontier[f];
+                int64_t cnt;
+                int64_t* nbrs = td_csr_neighbors(csr, node, &cnt);
+                for (int64_t j = 0; j < cnt; j++) {
+                    int64_t nbr = nbrs[j];
+                    if (nbr < 0 || nbr >= csr->n_nodes) continue;
+                    if (TD_SEL_BIT_TEST(visited, nbr)) continue;
+                    TD_SEL_BIT_SET(visited, nbr);
+
+                    /* Grow next_front if needed */
+                    if (next_len >= next_cap) {
+                        int64_t new_cap = next_cap * 2;
+                        int64_t* new_nf = (int64_t*)scratch_realloc(&next_hdr,
+                            (size_t)next_cap * sizeof(int64_t),
+                            (size_t)new_cap * sizeof(int64_t));
+                        if (!new_nf) break;
+                        next_front = new_nf;
+                        next_cap = new_cap;
+                    }
+                    next_front[next_len++] = nbr;
+
+                    /* Emit if within depth range */
+                    if (depth >= min_depth) {
+                        if (out_count >= out_cap) {
+                            int64_t new_oc = out_cap * 2;
+                            int64_t* ns = (int64_t*)scratch_realloc(&start_hdr,
+                                (size_t)out_cap * sizeof(int64_t),
+                                (size_t)new_oc * sizeof(int64_t));
+                            int64_t* ne = (int64_t*)scratch_realloc(&end_hdr,
+                                (size_t)out_cap * sizeof(int64_t),
+                                (size_t)new_oc * sizeof(int64_t));
+                            int64_t* nd = (int64_t*)scratch_realloc(&depth_hdr,
+                                (size_t)out_cap * sizeof(int64_t),
+                                (size_t)new_oc * sizeof(int64_t));
+                            if (!ns || !ne || !nd) break;
+                            out_start = ns; out_end = ne; out_depth = nd;
+                            out_cap = new_oc;
+                        }
+                        out_start[out_count] = start_node;
+                        out_end[out_count] = nbr;
+                        out_depth[out_count] = depth;
+                        out_count++;
+                    }
+                }
+            }
+
+            scratch_free(front_hdr);
+            front_hdr = next_hdr;
+            frontier = next_front;
+            front_len = next_len;
+        }
+
+        scratch_free(front_hdr);
+        td_release(visited_sel);
+    }
+
+cleanup:;
+    /* Build output table */
+    td_t* v_start = td_vec_from_raw(TD_I64, out_start, out_count);
+    td_t* v_end   = td_vec_from_raw(TD_I64, out_end,   out_count);
+    td_t* v_depth = td_vec_from_raw(TD_I64, out_depth, out_count);
+    scratch_free(start_hdr); scratch_free(end_hdr); scratch_free(depth_hdr);
+
+    if (!v_start || TD_IS_ERR(v_start) || !v_end || TD_IS_ERR(v_end) ||
+        !v_depth || TD_IS_ERR(v_depth)) {
+        if (v_start && !TD_IS_ERR(v_start)) td_release(v_start);
+        if (v_end && !TD_IS_ERR(v_end)) td_release(v_end);
+        if (v_depth && !TD_IS_ERR(v_depth)) td_release(v_depth);
+        return TD_ERR_PTR(TD_ERR_OOM);
+    }
+
+    int64_t start_sym = td_sym_intern("_start", 6);
+    int64_t end_sym   = td_sym_intern("_end", 4);
+    int64_t depth_sym = td_sym_intern("_depth", 6);
+
+    td_t* result = td_table_new(3);
+    if (!result || TD_IS_ERR(result)) {
+        td_release(v_start); td_release(v_end); td_release(v_depth);
+        return TD_ERR_PTR(TD_ERR_OOM);
+    }
+    result = td_table_add_col(result, start_sym, v_start);
+    result = td_table_add_col(result, end_sym,   v_end);
+    result = td_table_add_col(result, depth_sym, v_depth);
+    td_release(v_start); td_release(v_end); td_release(v_depth);
+    return result;
+}
+
+/* exec_shortest_path: BFS from src to dst with parent tracking */
+static td_t* exec_shortest_path(td_graph_t* g, td_op_t* op,
+                                 td_t* src_val, td_t* dst_val) {
+    td_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
+
+    td_rel_t* rel = (td_rel_t*)ext->graph.rel;
+    if (!rel) return TD_ERR_PTR(TD_ERR_SCHEMA);
+    td_csr_t* csr = &rel->fwd;
+    uint8_t max_depth = ext->graph.max_depth;
+
+    /* Extract single I64 values */
+    int64_t src_node, dst_node;
+    if (td_is_atom(src_val)) {
+        src_node = src_val->i64;
+    } else {
+        src_node = ((int64_t*)td_data(src_val))[0];
+    }
+    if (td_is_atom(dst_val)) {
+        dst_node = dst_val->i64;
+    } else {
+        dst_node = ((int64_t*)td_data(dst_val))[0];
+    }
+
+    if (src_node < 0 || src_node >= csr->n_nodes ||
+        dst_node < 0 || dst_node >= csr->n_nodes)
+        return TD_ERR_PTR(TD_ERR_RANGE);
+
+    /* Special case: src == dst */
+    if (src_node == dst_node) {
+        td_t* v_node = td_vec_from_raw(TD_I64, &src_node, 1);
+        int64_t zero = 0;
+        td_t* v_depth = td_vec_from_raw(TD_I64, &zero, 1);
+        td_t* result = td_table_new(2);
+        result = td_table_add_col(result, td_sym_intern("_node", 5), v_node);
+        result = td_table_add_col(result, td_sym_intern("_depth", 6), v_depth);
+        td_release(v_node); td_release(v_depth);
+        return result;
+    }
+
+    /* Allocate parent array (-1 = unvisited) */
+    td_t* parent_hdr;
+    int64_t* parent = (int64_t*)scratch_alloc(&parent_hdr,
+                                               (size_t)csr->n_nodes * sizeof(int64_t));
+    if (!parent) return TD_ERR_PTR(TD_ERR_OOM);
+    memset(parent, 0xFF, (size_t)csr->n_nodes * sizeof(int64_t)); /* -1 */
+    parent[src_node] = src_node;
+
+    /* BFS queue */
+    td_t* queue_hdr;
+    int64_t q_cap = 1024;
+    int64_t* queue = (int64_t*)scratch_alloc(&queue_hdr, (size_t)q_cap * sizeof(int64_t));
+    if (!queue) { scratch_free(parent_hdr); return TD_ERR_PTR(TD_ERR_OOM); }
+    queue[0] = src_node;
+    int64_t q_start = 0, q_end = 1;
+    bool found = false;
+
+    for (uint8_t depth = 1; depth <= max_depth && !found; depth++) {
+        int64_t level_end = q_end;
+        for (int64_t qi = q_start; qi < level_end && !found; qi++) {
+            int64_t node = queue[qi];
+            int64_t cnt;
+            int64_t* nbrs = td_csr_neighbors(csr, node, &cnt);
+            for (int64_t j = 0; j < cnt; j++) {
+                int64_t nbr = nbrs[j];
+                if (nbr < 0 || nbr >= csr->n_nodes) continue;
+                if (parent[nbr] != -1) continue;
+                parent[nbr] = node;
+
+                if (nbr == dst_node) { found = true; break; }
+
+                /* Grow queue if needed */
+                if (q_end >= q_cap) {
+                    int64_t new_cap = q_cap * 2;
+                    int64_t* new_q = (int64_t*)scratch_realloc(&queue_hdr,
+                        (size_t)q_cap * sizeof(int64_t),
+                        (size_t)new_cap * sizeof(int64_t));
+                    if (!new_q) { found = false; goto bfs_done; }
+                    queue = new_q;
+                    q_cap = new_cap;
+                }
+                queue[q_end++] = nbr;
+            }
+        }
+        q_start = level_end;
+    }
+
+bfs_done:
+    scratch_free(queue_hdr);
+
+    if (!found) {
+        scratch_free(parent_hdr);
+        return TD_ERR_PTR(TD_ERR_RANGE);
+    }
+
+    /* Reconstruct path */
+    int64_t path_buf[256];
+    int64_t path_len = 0;
+    int64_t cur = dst_node;
+    while (cur != src_node && path_len < 256) {
+        path_buf[path_len++] = cur;
+        cur = parent[cur];
+    }
+    path_buf[path_len++] = src_node;
+    scratch_free(parent_hdr);
+
+    /* Reverse path */
+    for (int64_t i = 0; i < path_len / 2; i++) {
+        int64_t tmp = path_buf[i];
+        path_buf[i] = path_buf[path_len - 1 - i];
+        path_buf[path_len - 1 - i] = tmp;
+    }
+
+    /* Build output table */
+    td_t* v_node = td_vec_from_raw(TD_I64, path_buf, path_len);
+    td_t* v_depth = td_vec_new(TD_I64, path_len);
+    if (!v_node || TD_IS_ERR(v_node) || !v_depth || TD_IS_ERR(v_depth)) {
+        if (v_node && !TD_IS_ERR(v_node)) td_release(v_node);
+        if (v_depth && !TD_IS_ERR(v_depth)) td_release(v_depth);
+        return TD_ERR_PTR(TD_ERR_OOM);
+    }
+    v_depth->len = path_len;
+    int64_t* dep_data = (int64_t*)td_data(v_depth);
+    for (int64_t i = 0; i < path_len; i++) dep_data[i] = i;
+
+    int64_t node_sym  = td_sym_intern("_node", 5);
+    int64_t depth_sym = td_sym_intern("_depth", 6);
+    td_t* result = td_table_new(2);
+    result = td_table_add_col(result, node_sym,  v_node);
+    result = td_table_add_col(result, depth_sym, v_depth);
+    td_release(v_node); td_release(v_depth);
+    return result;
+}
+
+/* exec_wco_join: Worst-Case Optimal Join via Leapfrog Triejoin */
+static td_t* exec_wco_join(td_graph_t* g, td_op_t* op) {
+    td_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
+
+    td_rel_t** rels = (td_rel_t**)ext->wco.rels;
+    uint8_t n_rels = ext->wco.n_rels;
+    uint8_t n_vars = ext->wco.n_vars;
+
+    /* Validate sorted CSR */
+    for (uint8_t r = 0; r < n_rels; r++) {
+        if (!rels[r]->fwd.sorted)
+            return TD_ERR_PTR(TD_ERR_DOMAIN);
+    }
+
+    /* For triangle pattern (n_vars=3, n_rels=3):
+     * variables: a, b, c
+     * rels[0]: a->b, rels[1]: b->c, rels[2]: c->a (or a->c)
+     *
+     * Simple triangle enumeration: iterate a, open b from r0.fwd[a],
+     * for each b open c from r1.fwd[b], seek c in r2.rev[a] */
+
+    /* Output buffers */
+    int64_t out_cap = 4096;
+    td_t** col_hdrs = NULL;
+    int64_t** col_data = NULL;
+    td_t* col_hdrs_block;
+    td_t* col_data_block;
+    col_hdrs = (td_t**)scratch_alloc(&col_hdrs_block, (size_t)n_vars * sizeof(td_t*));
+    col_data = (int64_t**)scratch_alloc(&col_data_block, (size_t)n_vars * sizeof(int64_t*));
+    if (!col_hdrs || !col_data) {
+        scratch_free(col_hdrs_block); scratch_free(col_data_block);
+        return TD_ERR_PTR(TD_ERR_OOM);
+    }
+
+    td_t* buf_hdrs[16];
+    for (uint8_t v = 0; v < n_vars; v++) {
+        col_data[v] = (int64_t*)scratch_alloc(&buf_hdrs[v], (size_t)out_cap * sizeof(int64_t));
+        if (!col_data[v]) {
+            for (uint8_t j = 0; j < v; j++) scratch_free(buf_hdrs[j]);
+            scratch_free(col_hdrs_block); scratch_free(col_data_block);
+            return TD_ERR_PTR(TD_ERR_OOM);
+        }
+    }
+    int64_t out_count = 0;
+
+    /* Simple triangle enumeration for n_vars=3, n_rels=3 */
+    if (n_vars == 3 && n_rels == 3) {
+        td_csr_t* csr0 = &rels[0]->fwd;
+        td_csr_t* csr1 = &rels[1]->fwd;
+        td_csr_t* csr2_rev = &rels[2]->rev;  /* c->a reverse = a's c neighbors */
+
+        int64_t n_a = csr0->n_nodes;
+        for (int64_t a = 0; a < n_a; a++) {
+            td_lftj_iter_t it_ab, it_ac;
+            lftj_open(&it_ab, csr0, a);
+            lftj_open(&it_ac, csr2_rev, a);
+
+            /* Intersect b candidates (from a->b via r0) and c candidates
+             * This is simplified: for proper LFTJ we intersect at each level */
+            while (!lftj_at_end(&it_ab)) {
+                int64_t b = lftj_key(&it_ab);
+                if (b >= 0 && b < csr1->n_nodes) {
+                    td_lftj_iter_t it_bc;
+                    lftj_open(&it_bc, csr1, b);
+
+                    /* Intersect c from b->c (r1.fwd) and c from a->c (r2.rev) */
+                    td_lftj_iter_t it_ac_copy = it_ac;
+                    it_ac_copy.pos = it_ac_copy.start;
+
+                    while (!lftj_at_end(&it_bc) && !lftj_at_end(&it_ac_copy)) {
+                        int64_t c_bc = lftj_key(&it_bc);
+                        int64_t c_ac = lftj_key(&it_ac_copy);
+                        if (c_bc == c_ac) {
+                            /* Found triangle (a, b, c) */
+                            if (out_count >= out_cap) {
+                                int64_t new_cap = out_cap * 2;
+                                for (uint8_t v = 0; v < n_vars; v++) {
+                                    int64_t* nd = (int64_t*)scratch_realloc(&buf_hdrs[v],
+                                        (size_t)out_cap * sizeof(int64_t),
+                                        (size_t)new_cap * sizeof(int64_t));
+                                    if (!nd) goto wco_done;
+                                    col_data[v] = nd;
+                                }
+                                out_cap = new_cap;
+                            }
+                            col_data[0][out_count] = a;
+                            col_data[1][out_count] = b;
+                            col_data[2][out_count] = c_bc;
+                            out_count++;
+                            lftj_next(&it_bc);
+                            lftj_next(&it_ac_copy);
+                        } else if (c_bc < c_ac) {
+                            lftj_seek(&it_bc, c_ac);
+                        } else {
+                            lftj_seek(&it_ac_copy, c_bc);
+                        }
+                    }
+                }
+                lftj_next(&it_ab);
+            }
+        }
+    } else if (n_vars == 2 && n_rels >= 2) {
+        /* Intersection of 2+ edge lists for 2-variable pattern */
+        td_csr_t* csr0 = &rels[0]->fwd;
+        int64_t n_a = csr0->n_nodes;
+        for (int64_t a = 0; a < n_a; a++) {
+            /* Open iterators for each relationship at node a */
+            td_lftj_iter_t iters_buf[16];
+            td_lftj_iter_t* iters[16];
+            for (uint8_t r = 0; r < n_rels && r < 16; r++) {
+                lftj_open(&iters_buf[r], &rels[r]->fwd, a);
+                iters[r] = &iters_buf[r];
+            }
+
+            int64_t val;
+            while (leapfrog_search(iters, n_rels, &val)) {
+                if (out_count >= out_cap) {
+                    int64_t new_cap = out_cap * 2;
+                    for (uint8_t v = 0; v < n_vars; v++) {
+                        int64_t* nd = (int64_t*)scratch_realloc(&buf_hdrs[v],
+                            (size_t)out_cap * sizeof(int64_t),
+                            (size_t)new_cap * sizeof(int64_t));
+                        if (!nd) goto wco_done;
+                        col_data[v] = nd;
+                    }
+                    out_cap = new_cap;
+                }
+                col_data[0][out_count] = a;
+                col_data[1][out_count] = val;
+                out_count++;
+                /* Advance all iterators past current match */
+                for (uint8_t r = 0; r < n_rels; r++) lftj_next(iters[r]);
+            }
+        }
+    }
+
+wco_done:;
+    /* Build output table */
+    td_t* result = td_table_new(n_vars);
+    if (!result || TD_IS_ERR(result)) {
+        for (uint8_t v = 0; v < n_vars; v++) scratch_free(buf_hdrs[v]);
+        scratch_free(col_hdrs_block); scratch_free(col_data_block);
+        return TD_ERR_PTR(TD_ERR_OOM);
+    }
+
+    for (uint8_t v = 0; v < n_vars; v++) {
+        td_t* vec = td_vec_from_raw(TD_I64, col_data[v], out_count);
+        scratch_free(buf_hdrs[v]);
+        if (!vec || TD_IS_ERR(vec)) {
+            for (uint8_t j = v + 1; j < n_vars; j++) scratch_free(buf_hdrs[j]);
+            scratch_free(col_hdrs_block); scratch_free(col_data_block);
+            td_release(result);
+            return TD_ERR_PTR(TD_ERR_OOM);
+        }
+        char name_buf[8];
+        int n = snprintf(name_buf, sizeof(name_buf), "_v%d", v);
+        int64_t name_id = td_sym_intern(name_buf, (size_t)n);
+        result = td_table_add_col(result, name_id, vec);
+        td_release(vec);
+    }
+
+    scratch_free(col_hdrs_block); scratch_free(col_data_block);
+    return result;
+}
+
+/* ============================================================================
  * Recursive executor
  * ============================================================================ */
 
@@ -9654,8 +10237,18 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
         case OP_SCAN: {
             td_op_ext_t* ext = find_ext(g, op->id);
             if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
-            if (!g->table) return TD_ERR_PTR(TD_ERR_SCHEMA);
-            td_t* col = td_table_get_col(g->table, ext->sym);
+
+            /* Resolve table: pad[0..1] stores table_id+1 (0 = default g->table) */
+            uint16_t stored_table_id = 0;
+            memcpy(&stored_table_id, ext->base.pad, sizeof(uint16_t));
+            td_t* scan_tbl;
+            if (stored_table_id > 0 && g->tables && (stored_table_id - 1) < g->n_tables) {
+                scan_tbl = g->tables[stored_table_id - 1];
+            } else {
+                scan_tbl = g->table;
+            }
+            if (!scan_tbl) return TD_ERR_PTR(TD_ERR_SCHEMA);
+            td_t* col = td_table_get_col(scan_tbl, ext->sym);
             if (!col) return TD_ERR_PTR(TD_ERR_SCHEMA);
             if (col->type == TD_MAPCOMMON)
                 return materialize_mapcommon(col);
@@ -10263,6 +10856,40 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             g->table = saved_table;
             td_release(input);
             return result;
+        }
+
+        case OP_EXPAND: {
+            td_t* src = exec_node(g, op->inputs[0]);
+            if (!src || TD_IS_ERR(src)) return src;
+            td_t* result = exec_expand(g, op, src);
+            td_release(src);
+            return result;
+        }
+
+        case OP_VAR_EXPAND: {
+            td_t* start = exec_node(g, op->inputs[0]);
+            if (!start || TD_IS_ERR(start)) return start;
+            td_t* result = exec_var_expand(g, op, start);
+            td_release(start);
+            return result;
+        }
+
+        case OP_SHORTEST_PATH: {
+            td_t* src = exec_node(g, op->inputs[0]);
+            td_t* dst = exec_node(g, op->inputs[1]);
+            if (!src || TD_IS_ERR(src)) {
+                if (dst && !TD_IS_ERR(dst)) td_release(dst);
+                return src;
+            }
+            if (!dst || TD_IS_ERR(dst)) { td_release(src); return dst; }
+            td_t* result = exec_shortest_path(g, op, src, dst);
+            td_release(src);
+            td_release(dst);
+            return result;
+        }
+
+        case OP_WCO_JOIN: {
+            return exec_wco_join(g, op);
         }
 
         default:

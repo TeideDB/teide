@@ -393,6 +393,12 @@ static inline uint8_t td_sym_dict_width(int64_t dict_size) {
 #define OP_VAR_POP      75
 #define OP_ILIKE        76
 
+/* Opcodes — Graph */
+#define OP_EXPAND        80   /* 1-hop CSR neighbor expansion       */
+#define OP_VAR_EXPAND    81   /* variable-length BFS/DFS            */
+#define OP_SHORTEST_PATH 82   /* BFS shortest path                  */
+#define OP_WCO_JOIN      83   /* worst-case optimal join (LFTJ)     */
+
 /* Opcodes — Misc */
 #define OP_ALIAS        70
 #define OP_MATERIALIZE  71
@@ -481,6 +487,18 @@ typedef struct td_op_ext {
             int64_t    frame_start_n;
             int64_t    frame_end_n;
         } window;
+        struct {  /* OP_EXPAND / OP_VAR_EXPAND / OP_SHORTEST_PATH */
+            void*     rel;            /* td_rel_t* (opaque to public header) */
+            uint8_t   direction;      /* 0=fwd, 1=rev, 2=both */
+            uint8_t   min_depth;
+            uint8_t   max_depth;
+            uint8_t   path_tracking;
+        } graph;
+        struct {  /* OP_WCO_JOIN */
+            void**    rels;           /* td_rel_t** array */
+            uint8_t   n_rels;
+            uint8_t   n_vars;
+        } wco;
     };
 } td_op_ext_t;
 
@@ -490,6 +508,8 @@ typedef struct td_graph {
     uint32_t       node_count;  /* number of nodes */
     uint32_t       node_cap;    /* allocated capacity */
     td_t*          table;       /* bound table (provides columns for OP_SCAN) */
+    td_t**         tables;      /* table registry (indexed by table_id) */
+    uint16_t       n_tables;    /* number of registered tables */
     td_op_ext_t**  ext_nodes;   /* tracked extended nodes for cleanup */
     uint32_t       ext_count;   /* number of extended nodes */
     uint32_t       ext_cap;     /* capacity of ext_nodes array */
@@ -587,6 +607,8 @@ typedef struct td_sym_map   td_sym_map_t;
 typedef struct td_pool      td_pool_t;
 typedef struct td_task      td_task_t;
 typedef struct td_dispatch  td_dispatch_t;
+typedef struct td_csr       td_csr_t;
+typedef struct td_rel       td_rel_t;
 
 /* ===== Thread Types ===== */
 
@@ -834,6 +856,37 @@ td_op_t* td_head(td_graph_t* g, td_op_t* input, int64_t n);
 td_op_t* td_tail(td_graph_t* g, td_op_t* input, int64_t n);
 td_op_t* td_alias(td_graph_t* g, td_op_t* input, const char* name);
 td_op_t* td_materialize(td_graph_t* g, td_op_t* input);
+
+/* ===== Graph Ops ===== */
+
+/* Multi-table support */
+uint16_t td_graph_add_table(td_graph_t* g, td_t* table);
+td_op_t* td_scan_table(td_graph_t* g, uint16_t table_id, const char* col_name);
+
+/* Graph traversal */
+td_op_t* td_expand(td_graph_t* g, td_op_t* src_nodes,
+                    td_rel_t* rel, uint8_t direction);
+td_op_t* td_var_expand(td_graph_t* g, td_op_t* start_nodes,
+                        td_rel_t* rel, uint8_t direction,
+                        uint8_t min_depth, uint8_t max_depth,
+                        bool track_path);
+td_op_t* td_shortest_path(td_graph_t* g, td_op_t* src, td_op_t* dst,
+                           td_rel_t* rel, uint8_t max_depth);
+td_op_t* td_wco_join(td_graph_t* g,
+                      td_rel_t** rels, uint8_t n_rels,
+                      uint8_t n_vars);
+
+/* CSR / Relationship API */
+td_rel_t* td_rel_build(td_t* from_table, const char* fk_col,
+                         int64_t n_target_nodes, bool sort_targets);
+td_rel_t* td_rel_from_edges(td_t* edge_table,
+                             const char* src_col, const char* dst_col,
+                             int64_t n_src_nodes, int64_t n_dst_nodes,
+                             bool sort_targets);
+td_err_t  td_rel_save(td_rel_t* rel, const char* dir);
+td_rel_t* td_rel_load(const char* dir);
+td_rel_t* td_rel_mmap(const char* dir);
+void      td_rel_free(td_rel_t* rel);
 
 /* ===== Optimizer API ===== */
 

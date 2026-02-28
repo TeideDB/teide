@@ -22,6 +22,7 @@
  */
 
 #include "graph.h"
+#include "store/csr.h"
 #include "mem/sys.h"
 #include <string.h>
 
@@ -77,6 +78,12 @@ static void graph_fixup_ext_ptrs(td_graph_t* g, ptrdiff_t delta) {
             case OP_SELECT:
                 for (uint8_t k = 0; k < ext->sort.n_cols; k++)
                     ext->sort.columns[k] = graph_fix_ptr(ext->sort.columns[k], delta);
+                break;
+            /* Graph ops: no td_op_t* pointers in ext union to fix */
+            case OP_EXPAND:
+            case OP_VAR_EXPAND:
+            case OP_SHORTEST_PATH:
+            case OP_WCO_JOIN:
                 break;
             default:
                 break;
@@ -181,6 +188,9 @@ td_graph_t* td_graph_new(td_t* tbl) {
     g->table = tbl;
     if (tbl) td_retain(tbl);
 
+    g->tables = NULL;
+    g->n_tables = 0;
+
     g->ext_nodes = NULL;
     g->ext_count = 0;
     g->ext_cap = 0;
@@ -207,6 +217,15 @@ void td_graph_free(td_graph_t* g) {
 
     td_sys_free(g->nodes);
     if (g->table) td_release(g->table);
+
+    /* Release table registry */
+    if (g->tables) {
+        for (uint16_t i = 0; i < g->n_tables; i++) {
+            if (g->tables[i]) td_release(g->tables[i]);
+        }
+        td_sys_free(g->tables);
+    }
+
     if (g->selection) td_release(g->selection);
     td_sys_free(g);
 }
@@ -1007,4 +1026,156 @@ td_op_t* td_materialize(td_graph_t* g, td_op_t* input) {
     n->out_type = input->out_type;
     n->est_rows = input->est_rows;
     return n;
+}
+
+/* --------------------------------------------------------------------------
+ * Multi-table support
+ * -------------------------------------------------------------------------- */
+
+uint16_t td_graph_add_table(td_graph_t* g, td_t* table) {
+    uint16_t id = g->n_tables;
+    uint16_t new_cap = id + 1;
+
+    td_t** new_tables = (td_t**)td_sys_realloc(g->tables,
+                                                (size_t)new_cap * sizeof(td_t*));
+    if (!new_tables) return UINT16_MAX;  /* error sentinel */
+    g->tables = new_tables;
+    g->tables[id] = table;
+    td_retain(table);
+    g->n_tables = new_cap;
+
+    return id;
+}
+
+td_op_t* td_scan_table(td_graph_t* g, uint16_t table_id, const char* col_name) {
+    if (table_id >= g->n_tables || !g->tables[table_id]) return NULL;
+
+    td_op_ext_t* ext = graph_alloc_ext_node(g);
+    if (!ext) return NULL;
+
+    ext->base.opcode = OP_SCAN;
+    ext->base.arity = 0;
+
+    int64_t sym_id = td_sym_intern(col_name, strlen(col_name));
+    ext->sym = sym_id;
+
+    /* Store table_id+1 in pad[0..1] as uint16_t (0 = default g->table) */
+    uint16_t stored_id = table_id + 1;
+    memcpy(ext->base.pad, &stored_id, sizeof(uint16_t));
+
+    /* Infer output type from the specified table */
+    td_t* tbl = g->tables[table_id];
+    if (tbl) {
+        td_t* col = td_table_get_col(tbl, sym_id);
+        if (col) {
+            ext->base.out_type = col->type;
+            ext->base.est_rows = (uint32_t)col->len;
+        }
+    }
+
+    g->nodes[ext->base.id] = ext->base;
+    return &g->nodes[ext->base.id];
+}
+
+/* --------------------------------------------------------------------------
+ * Graph traversal DAG builders
+ * -------------------------------------------------------------------------- */
+
+td_op_t* td_expand(td_graph_t* g, td_op_t* src_nodes,
+                    td_rel_t* rel, uint8_t direction) {
+    uint32_t src_id = src_nodes->id;
+    uint32_t est = src_nodes->est_rows;
+
+    td_op_ext_t* ext = graph_alloc_ext_node(g);
+    if (!ext) return NULL;
+    src_nodes = &g->nodes[src_id];
+
+    ext->base.opcode = OP_EXPAND;
+    ext->base.arity = 1;
+    ext->base.inputs[0] = src_nodes;
+    ext->base.out_type = TD_TABLE;
+    ext->base.est_rows = est * 10;  /* rough estimate: 10x fan-out */
+    ext->graph.rel = rel;
+    ext->graph.direction = direction;
+    ext->graph.min_depth = 1;
+    ext->graph.max_depth = 1;
+    ext->graph.path_tracking = 0;
+
+    g->nodes[ext->base.id] = ext->base;
+    return &g->nodes[ext->base.id];
+}
+
+td_op_t* td_var_expand(td_graph_t* g, td_op_t* start_nodes,
+                        td_rel_t* rel, uint8_t direction,
+                        uint8_t min_depth, uint8_t max_depth,
+                        bool track_path) {
+    uint32_t src_id = start_nodes->id;
+    uint32_t est = start_nodes->est_rows;
+
+    td_op_ext_t* ext = graph_alloc_ext_node(g);
+    if (!ext) return NULL;
+    start_nodes = &g->nodes[src_id];
+
+    ext->base.opcode = OP_VAR_EXPAND;
+    ext->base.arity = 1;
+    ext->base.inputs[0] = start_nodes;
+    ext->base.out_type = TD_TABLE;
+    ext->base.est_rows = est * 100;  /* rough estimate */
+    ext->graph.rel = rel;
+    ext->graph.direction = direction;
+    ext->graph.min_depth = min_depth;
+    ext->graph.max_depth = max_depth;
+    ext->graph.path_tracking = track_path ? 1 : 0;
+
+    g->nodes[ext->base.id] = ext->base;
+    return &g->nodes[ext->base.id];
+}
+
+td_op_t* td_shortest_path(td_graph_t* g, td_op_t* src, td_op_t* dst,
+                           td_rel_t* rel, uint8_t max_depth) {
+    uint32_t src_id = src->id;
+    uint32_t dst_id = dst->id;
+
+    td_op_ext_t* ext = graph_alloc_ext_node(g);
+    if (!ext) return NULL;
+    src = &g->nodes[src_id];
+    dst = &g->nodes[dst_id];
+
+    ext->base.opcode = OP_SHORTEST_PATH;
+    ext->base.arity = 2;
+    ext->base.inputs[0] = src;
+    ext->base.inputs[1] = dst;
+    ext->base.out_type = TD_TABLE;
+    ext->base.est_rows = max_depth;
+    ext->graph.rel = rel;
+    ext->graph.direction = 0;  /* forward by default */
+    ext->graph.min_depth = 0;
+    ext->graph.max_depth = max_depth;
+    ext->graph.path_tracking = 0;
+
+    g->nodes[ext->base.id] = ext->base;
+    return &g->nodes[ext->base.id];
+}
+
+td_op_t* td_wco_join(td_graph_t* g,
+                      td_rel_t** rels, uint8_t n_rels,
+                      uint8_t n_vars) {
+    size_t extra = (size_t)n_rels * sizeof(td_rel_t*);
+    td_op_ext_t* ext = graph_alloc_ext_node_ex(g, extra);
+    if (!ext) return NULL;
+
+    ext->base.opcode = OP_WCO_JOIN;
+    ext->base.arity = 0;
+    ext->base.out_type = TD_TABLE;
+    ext->base.est_rows = 1000;  /* rough estimate */
+
+    /* Copy rels array into trailing bytes */
+    td_rel_t** trail = (td_rel_t**)EXT_TRAIL(ext);
+    memcpy(trail, rels, (size_t)n_rels * sizeof(td_rel_t*));
+    ext->wco.rels = (void**)trail;
+    ext->wco.n_rels = n_rels;
+    ext->wco.n_vars = n_vars;
+
+    g->nodes[ext->base.id] = ext->base;
+    return &g->nodes[ext->base.id];
 }
