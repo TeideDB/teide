@@ -28,6 +28,9 @@
 #include <sys/stat.h>
 #include <errno.h>
 
+/* Forward declaration */
+static void csr_free(td_csr_t* csr);
+
 /* --------------------------------------------------------------------------
  * CSR construction helpers
  * -------------------------------------------------------------------------- */
@@ -95,8 +98,15 @@ static td_err_t csr_build_from_pairs(edge_pair_t* pairs, int64_t n_edges,
                                       int64_t n_nodes, bool is_reverse,
                                       bool sort_targets, td_csr_t* out) {
     out->n_nodes = n_nodes;
-    out->n_edges = n_edges;
     out->props = NULL;
+
+    /* Count valid edges (those within [0, n_nodes) range) */
+    int64_t valid_edges = 0;
+    for (int64_t i = 0; i < n_edges; i++) {
+        int64_t key = is_reverse ? pairs[i].dst : pairs[i].src;
+        if (key >= 0 && key < n_nodes) valid_edges++;
+    }
+    out->n_edges = valid_edges;
 
     /* Allocate offsets (n_nodes + 1) */
     out->offsets = td_vec_new(TD_I64, n_nodes + 1);
@@ -106,22 +116,22 @@ static td_err_t csr_build_from_pairs(edge_pair_t* pairs, int64_t n_edges,
     memset(off, 0, (size_t)(n_nodes + 1) * sizeof(int64_t));
 
     /* Allocate targets */
-    out->targets = td_vec_new(TD_I64, n_edges > 0 ? n_edges : 1);
+    out->targets = td_vec_new(TD_I64, valid_edges > 0 ? valid_edges : 1);
     if (!out->targets || TD_IS_ERR(out->targets)) {
         td_release(out->offsets); out->offsets = NULL;
         return TD_ERR_OOM;
     }
-    out->targets->len = n_edges;
+    out->targets->len = valid_edges;
     int64_t* tgt = (int64_t*)td_data(out->targets);
 
     /* Allocate rowmap */
-    out->rowmap = td_vec_new(TD_I64, n_edges > 0 ? n_edges : 1);
+    out->rowmap = td_vec_new(TD_I64, valid_edges > 0 ? valid_edges : 1);
     if (!out->rowmap || TD_IS_ERR(out->rowmap)) {
         td_release(out->offsets); out->offsets = NULL;
         td_release(out->targets); out->targets = NULL;
         return TD_ERR_OOM;
     }
-    out->rowmap->len = n_edges;
+    out->rowmap->len = valid_edges;
     int64_t* rmap = (int64_t*)td_data(out->rowmap);
 
     /* Count degrees */
@@ -184,9 +194,11 @@ td_rel_t* td_rel_from_edges(td_t* edge_table,
     td_t* src_vec = td_table_get_col(edge_table, src_sym);
     td_t* dst_vec = td_table_get_col(edge_table, dst_sym);
     if (!src_vec || !dst_vec) return NULL;
+    if (src_vec->type != TD_I64 || dst_vec->type != TD_I64) return NULL;
 
     int64_t n_edges = src_vec->len;
     if (n_edges != dst_vec->len) return NULL;
+    if (n_src_nodes < 0 || n_dst_nodes < 0) return NULL;
 
     /* Build edge pairs */
     td_t* pairs_hdr = td_alloc((size_t)n_edges * sizeof(edge_pair_t));
@@ -224,9 +236,7 @@ td_rel_t* td_rel_from_edges(td_t* edge_table,
                                 sort_targets, &rel->rev);
     if (err != TD_OK) {
         td_free(pairs_hdr);
-        td_release(rel->fwd.offsets);
-        td_release(rel->fwd.targets);
-        td_release(rel->fwd.rowmap);
+        csr_free(&rel->fwd);
         td_sys_free(rel);
         return NULL;
     }
@@ -246,7 +256,8 @@ td_rel_t* td_rel_build(td_t* from_table, const char* fk_col,
 
     int64_t fk_sym = td_sym_intern(fk_col, strlen(fk_col));
     td_t* fk_vec = td_table_get_col(from_table, fk_sym);
-    if (!fk_vec) return NULL;
+    if (!fk_vec || fk_vec->type != TD_I64) return NULL;
+    if (n_target_nodes < 0) return NULL;
 
     int64_t n_edges = fk_vec->len;
     int64_t n_src_nodes = td_table_nrows(from_table);
@@ -284,9 +295,7 @@ td_rel_t* td_rel_build(td_t* from_table, const char* fk_col,
                                 sort_targets, &rel->rev);
     if (err != TD_OK) {
         td_free(pairs_hdr);
-        td_release(rel->fwd.offsets);
-        td_release(rel->fwd.targets);
-        td_release(rel->fwd.rowmap);
+        csr_free(&rel->fwd);
         td_sys_free(rel);
         return NULL;
     }
@@ -375,8 +384,24 @@ static td_err_t csr_load_impl(td_csr_t* csr, const char* dir, const char* prefix
         csr->rowmap = NULL;
     }
 
+    if (csr->offsets->len < 1) {
+        td_release(csr->offsets); csr->offsets = NULL;
+        td_release(csr->targets); csr->targets = NULL;
+        if (csr->rowmap) { td_release(csr->rowmap); csr->rowmap = NULL; }
+        return TD_ERR_IO;
+    }
     csr->n_nodes = csr->offsets->len - 1;
     csr->n_edges = csr->targets->len;
+
+    /* Consistency: offsets[n_nodes] must equal targets->len */
+    int64_t* off_data = (int64_t*)td_data(csr->offsets);
+    if (off_data[csr->n_nodes] != csr->n_edges) {
+        td_release(csr->offsets); csr->offsets = NULL;
+        td_release(csr->targets); csr->targets = NULL;
+        if (csr->rowmap) { td_release(csr->rowmap); csr->rowmap = NULL; }
+        return TD_ERR_IO;
+    }
+
     csr->sorted = false;  /* caller sets if known */
     csr->props = NULL;
 

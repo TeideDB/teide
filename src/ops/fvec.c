@@ -68,11 +68,13 @@ td_t* td_ftable_materialize(td_ftable_t* ft) {
         td_t* col;
         if (fv->cur_idx >= 0) {
             /* Flat: replicate single value */
+            if (fv->cardinality <= 0) { td_release(tbl); return TD_ERR_PTR(TD_ERR_RANGE); }
             col = td_vec_new(fv->vec->type, fv->cardinality);
-            if (!col || TD_IS_ERR(col)) { td_release(tbl); return col; }
+            if (!col || TD_IS_ERR(col)) { td_release(tbl); return col ? col : TD_ERR_PTR(TD_ERR_OOM); }
             col->len = fv->cardinality;
             void* val = td_vec_get(fv->vec, fv->cur_idx);
-            uint8_t esz = td_elem_size(fv->vec->type);
+            if (!val) { td_release(col); td_release(tbl); return TD_ERR_PTR(TD_ERR_RANGE); }
+            uint8_t esz = td_sym_elem_size(fv->vec->type, fv->vec->attrs);
             char* dst = (char*)td_data(col);
             for (int64_t r = 0; r < fv->cardinality; r++)
                 memcpy(dst + r * esz, val, esz);
@@ -82,11 +84,16 @@ td_t* td_ftable_materialize(td_ftable_t* ft) {
             td_retain(col);
         }
 
-        char name_buf[8];
+        char name_buf[12];
         int n = snprintf(name_buf, sizeof(name_buf), "_c%d", c);
         int64_t name_id = td_sym_intern(name_buf, (size_t)n);
-        tbl = td_table_add_col(tbl, name_id, col);
+        td_t* new_tbl = td_table_add_col(tbl, name_id, col);
         td_release(col);
+        if (!new_tbl || TD_IS_ERR(new_tbl)) {
+            if (new_tbl != tbl) td_release(tbl);
+            return new_tbl ? new_tbl : TD_ERR_PTR(TD_ERR_OOM);
+        }
+        tbl = new_tbl;
     }
 
     return tbl;

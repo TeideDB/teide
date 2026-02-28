@@ -7657,8 +7657,9 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
      *
      * Applied when: single I64 key, inner join, left side is large enough
      * to benefit from filtering (> 2x right side). */
-    if (n_keys == 1 && join_type == 0 && l_key_vecs[0] &&
-        l_key_vecs[0]->type == TD_I64 && left_rows > right_rows * 2) {
+    if (n_keys == 1 && join_type == 0 && l_key_vecs[0] && r_key_vecs[0] &&
+        l_key_vecs[0]->type == TD_I64 && r_key_vecs[0]->type == TD_I64 &&
+        left_rows > right_rows * 2) {
         /* Determine key range to size the bitmap */
         int64_t* rk = (int64_t*)td_data(r_key_vecs[0]);
         int64_t key_max = 0;
@@ -9873,8 +9874,12 @@ static td_t* exec_expand_factorized(td_rel_t* rel, uint8_t direction, td_t* src_
         td_release(out_src); td_release(out_cnt);
         return TD_ERR_PTR(TD_ERR_OOM);
     }
-    result = td_table_add_col(result, src_sym, out_src);
-    result = td_table_add_col(result, cnt_sym, out_cnt);
+    td_t* tmp = td_table_add_col(result, src_sym, out_src);
+    if (!tmp || TD_IS_ERR(tmp)) { td_release(out_src); td_release(out_cnt); td_release(result); return TD_ERR_PTR(TD_ERR_OOM); }
+    result = tmp;
+    tmp = td_table_add_col(result, cnt_sym, out_cnt);
+    if (!tmp || TD_IS_ERR(tmp)) { td_release(out_src); td_release(out_cnt); td_release(result); return TD_ERR_PTR(TD_ERR_OOM); }
+    result = tmp;
     td_release(out_src); td_release(out_cnt);
     return result;
 }
@@ -9908,15 +9913,22 @@ static td_t* exec_expand(td_graph_t* g, td_op_t* op, td_t* src_vec) {
     if (!sip_sel) {
         uint8_t filter_hint = ext->base.pad[2];
         if (filter_hint > 0 && n_src > 64) {
-            /* Build SIP bitmap: mark source nodes with degree > 0 */
-            td_csr_t* csr = (direction == 1) ? &rel->rev : &rel->fwd;
-            int64_t nn = csr->n_nodes;
+            /* Build SIP bitmap: mark source nodes with degree > 0.
+             * For direction==2 (both), check both fwd and rev CSRs. */
+            int64_t nn = rel->fwd.n_nodes;
+            if (rel->rev.n_nodes > nn) nn = rel->rev.n_nodes;
             td_t* built_sel = td_sel_new(nn);
             if (built_sel && !TD_IS_ERR(built_sel)) {
                 uint64_t* bits = td_sel_bits(built_sel);
-                for (int64_t nd = 0; nd < nn; nd++) {
-                    if (td_csr_degree(csr, nd) > 0)
-                        TD_SEL_BIT_SET(bits, nd);
+                if (direction == 0 || direction == 2) {
+                    for (int64_t nd = 0; nd < rel->fwd.n_nodes; nd++)
+                        if (td_csr_degree(&rel->fwd, nd) > 0)
+                            TD_SEL_BIT_SET(bits, nd);
+                }
+                if (direction == 1 || direction == 2) {
+                    for (int64_t nd = 0; nd < rel->rev.n_nodes; nd++)
+                        if (td_csr_degree(&rel->rev, nd) > 0)
+                            TD_SEL_BIT_SET(bits, nd);
                 }
                 ext->graph.sip_sel = built_sel;
                 sip_sel = built_sel;
@@ -9975,8 +9987,12 @@ static td_t* exec_expand(td_graph_t* g, td_op_t* op, td_t* src_vec) {
             td_release(d_src); td_release(d_dst); \
             return TD_ERR_PTR(TD_ERR_OOM); \
         } \
-        result = td_table_add_col(result, src_sym, d_src); \
-        result = td_table_add_col(result, dst_sym, d_dst); \
+        td_t* _tmp = td_table_add_col(result, src_sym, d_src); \
+        if (!_tmp || TD_IS_ERR(_tmp)) { td_release(d_src); td_release(d_dst); td_release(result); return TD_ERR_PTR(TD_ERR_OOM); } \
+        result = _tmp; \
+        _tmp = td_table_add_col(result, dst_sym, d_dst); \
+        if (!_tmp || TD_IS_ERR(_tmp)) { td_release(d_src); td_release(d_dst); td_release(result); return TD_ERR_PTR(TD_ERR_OOM); } \
+        result = _tmp; \
         td_release(d_src); td_release(d_dst); \
         return result; \
     } while (0)
@@ -10054,8 +10070,12 @@ static td_t* exec_expand(td_graph_t* g, td_op_t* op, td_t* src_vec) {
             td_release(d_src); td_release(d_dst);
             return TD_ERR_PTR(TD_ERR_OOM);
         }
-        result = td_table_add_col(result, src_sym, d_src);
-        result = td_table_add_col(result, dst_sym, d_dst);
+        td_t* tmp = td_table_add_col(result, src_sym, d_src);
+        if (!tmp || TD_IS_ERR(tmp)) { td_release(d_src); td_release(d_dst); td_release(result); return TD_ERR_PTR(TD_ERR_OOM); }
+        result = tmp;
+        tmp = td_table_add_col(result, dst_sym, d_dst);
+        if (!tmp || TD_IS_ERR(tmp)) { td_release(d_src); td_release(d_dst); td_release(result); return TD_ERR_PTR(TD_ERR_OOM); }
+        result = tmp;
         td_release(d_src); td_release(d_dst);
         return result;
     }
@@ -10073,7 +10093,10 @@ static td_t* exec_var_expand(td_graph_t* g, td_op_t* op, td_t* start_vec) {
     uint8_t direction = ext->graph.direction;
     uint8_t min_depth = ext->graph.min_depth;
     uint8_t max_depth = ext->graph.max_depth;
-    td_csr_t* csr = (direction == 1) ? &rel->rev : &rel->fwd;
+    td_csr_t* csr_fwd = &rel->fwd;
+    td_csr_t* csr_rev = &rel->rev;
+    /* For direction==2 (both), use fwd for n_nodes bound but expand both */
+    td_csr_t* csr = (direction == 1) ? csr_rev : csr_fwd;
 
     int64_t n_start = start_vec->len;
     int64_t* start_data = (int64_t*)td_data(start_vec);
@@ -10090,13 +10113,18 @@ static td_t* exec_var_expand(td_graph_t* g, td_op_t* op, td_t* start_vec) {
     }
     int64_t out_count = 0;
 
+    /* For direction==2, use the larger n_nodes bound */
+    int64_t bfs_n_nodes = csr->n_nodes;
+    if (direction == 2 && csr_rev->n_nodes > bfs_n_nodes)
+        bfs_n_nodes = csr_rev->n_nodes;
+
     /* BFS per start node */
     for (int64_t s = 0; s < n_start; s++) {
         int64_t start_node = start_data[s];
-        if (start_node < 0 || start_node >= csr->n_nodes) continue;
+        if (start_node < 0 || start_node >= bfs_n_nodes) continue;
 
         /* Visited bitmap via TD_SEL */
-        td_t* visited_sel = td_sel_new(csr->n_nodes);
+        td_t* visited_sel = td_sel_new(bfs_n_nodes);
         if (!visited_sel || TD_IS_ERR(visited_sel)) continue;
         uint64_t* visited = td_sel_bits(visited_sel);
         TD_SEL_BIT_SET(visited, start_node);
@@ -10111,7 +10139,7 @@ static td_t* exec_var_expand(td_graph_t* g, td_op_t* op, td_t* start_vec) {
 
         for (uint8_t depth = 1; depth <= max_depth && front_len > 0; depth++) {
             td_t* next_hdr;
-            int64_t next_cap = front_len * 4;
+            int64_t next_cap = (front_len > INT64_MAX / 4) ? INT64_MAX : front_len * 4;
             if (next_cap < 64) next_cap = 64;
             int64_t* next_front = (int64_t*)scratch_alloc(&next_hdr, (size_t)next_cap * sizeof(int64_t));
             if (!next_front) { scratch_free(front_hdr); td_release(visited_sel); goto cleanup; }
@@ -10119,16 +10147,24 @@ static td_t* exec_var_expand(td_graph_t* g, td_op_t* op, td_t* start_vec) {
 
             for (int64_t f = 0; f < front_len; f++) {
                 int64_t node = frontier[f];
+                /* Expand neighbors from active CSR(s).
+                 * For direction==2 (both), expand fwd then rev. */
+                int n_csrs = (direction == 2) ? 2 : 1;
+                td_csr_t* csrs[2] = { csr, csr_rev };
+                for (int ci = 0; ci < n_csrs; ci++) {
+                    td_csr_t* cur_csr = csrs[ci];
+                    if (node < 0 || node >= cur_csr->n_nodes) continue;
                 int64_t cnt;
-                int64_t* nbrs = td_csr_neighbors(csr, node, &cnt);
+                int64_t* nbrs = td_csr_neighbors(cur_csr, node, &cnt);
                 for (int64_t j = 0; j < cnt; j++) {
                     int64_t nbr = nbrs[j];
-                    if (nbr < 0 || nbr >= csr->n_nodes) continue;
+                    if (nbr < 0 || nbr >= bfs_n_nodes) continue;
                     if (TD_SEL_BIT_TEST(visited, nbr)) continue;
                     TD_SEL_BIT_SET(visited, nbr);
 
                     /* Grow next_front if needed */
                     if (next_len >= next_cap) {
+                        if (next_cap > INT64_MAX / 2) break;
                         int64_t new_cap = next_cap * 2;
                         int64_t* new_nf = (int64_t*)scratch_realloc(&next_hdr,
                             (size_t)next_cap * sizeof(int64_t),
@@ -10142,18 +10178,26 @@ static td_t* exec_var_expand(td_graph_t* g, td_op_t* op, td_t* start_vec) {
                     /* Emit if within depth range */
                     if (depth >= min_depth) {
                         if (out_count >= out_cap) {
+                            if (out_cap > INT64_MAX / 2) break;
                             int64_t new_oc = out_cap * 2;
-                            int64_t* ns = (int64_t*)scratch_realloc(&start_hdr,
-                                (size_t)out_cap * sizeof(int64_t),
-                                (size_t)new_oc * sizeof(int64_t));
-                            int64_t* ne = (int64_t*)scratch_realloc(&end_hdr,
-                                (size_t)out_cap * sizeof(int64_t),
-                                (size_t)new_oc * sizeof(int64_t));
-                            int64_t* nd = (int64_t*)scratch_realloc(&depth_hdr,
-                                (size_t)out_cap * sizeof(int64_t),
-                                (size_t)new_oc * sizeof(int64_t));
-                            if (!ns || !ne || !nd) break;
-                            out_start = ns; out_end = ne; out_depth = nd;
+                            /* Grow all three buffers atomically — alloc new
+                             * copies first, commit only if all succeed. */
+                            td_t *ns_h = NULL, *ne_h = NULL, *nd_h = NULL;
+                            size_t old_sz = (size_t)out_cap * sizeof(int64_t);
+                            size_t new_sz = (size_t)new_oc * sizeof(int64_t);
+                            int64_t* ns = (int64_t*)scratch_alloc(&ns_h, new_sz);
+                            int64_t* ne = (int64_t*)scratch_alloc(&ne_h, new_sz);
+                            int64_t* nd_buf = (int64_t*)scratch_alloc(&nd_h, new_sz);
+                            if (!ns || !ne || !nd_buf) {
+                                scratch_free(ns_h); scratch_free(ne_h); scratch_free(nd_h);
+                                break;
+                            }
+                            memcpy(ns, out_start, old_sz);
+                            memcpy(ne, out_end, old_sz);
+                            memcpy(nd_buf, out_depth, old_sz);
+                            scratch_free(start_hdr); scratch_free(end_hdr); scratch_free(depth_hdr);
+                            start_hdr = ns_h; end_hdr = ne_h; depth_hdr = nd_h;
+                            out_start = ns; out_end = ne; out_depth = nd_buf;
                             out_cap = new_oc;
                         }
                         out_start[out_count] = start_node;
@@ -10162,6 +10206,7 @@ static td_t* exec_var_expand(td_graph_t* g, td_op_t* op, td_t* start_vec) {
                         out_count++;
                     }
                 }
+                } /* end for ci (CSR directions) */
             }
 
             scratch_free(front_hdr);
@@ -10198,9 +10243,15 @@ cleanup:;
         td_release(v_start); td_release(v_end); td_release(v_depth);
         return TD_ERR_PTR(TD_ERR_OOM);
     }
-    result = td_table_add_col(result, start_sym, v_start);
-    result = td_table_add_col(result, end_sym,   v_end);
-    result = td_table_add_col(result, depth_sym, v_depth);
+    td_t* tmp = td_table_add_col(result, start_sym, v_start);
+    if (!tmp || TD_IS_ERR(tmp)) { td_release(v_start); td_release(v_end); td_release(v_depth); td_release(result); return TD_ERR_PTR(TD_ERR_OOM); }
+    result = tmp;
+    tmp = td_table_add_col(result, end_sym, v_end);
+    if (!tmp || TD_IS_ERR(tmp)) { td_release(v_start); td_release(v_end); td_release(v_depth); td_release(result); return TD_ERR_PTR(TD_ERR_OOM); }
+    result = tmp;
+    tmp = td_table_add_col(result, depth_sym, v_depth);
+    if (!tmp || TD_IS_ERR(tmp)) { td_release(v_start); td_release(v_end); td_release(v_depth); td_release(result); return TD_ERR_PTR(TD_ERR_OOM); }
+    result = tmp;
     td_release(v_start); td_release(v_end); td_release(v_depth);
     return result;
 }
@@ -10213,7 +10264,14 @@ static td_t* exec_shortest_path(td_graph_t* g, td_op_t* op,
 
     td_rel_t* rel = (td_rel_t*)ext->graph.rel;
     if (!rel) return TD_ERR_PTR(TD_ERR_SCHEMA);
-    td_csr_t* csr = &rel->fwd;
+    uint8_t direction = ext->graph.direction;
+    td_csr_t* csr = (direction == 1) ? &rel->rev : &rel->fwd;
+    td_csr_t* csr_rev = &rel->rev;
+    int n_csrs = (direction == 2) ? 2 : 1;
+    td_csr_t* csrs[2] = { csr, csr_rev };
+    int64_t bfs_n_nodes = csr->n_nodes;
+    if (direction == 2 && csr_rev->n_nodes > bfs_n_nodes)
+        bfs_n_nodes = csr_rev->n_nodes;
     uint8_t max_depth = ext->graph.max_depth;
 
     /* Extract single I64 values */
@@ -10221,16 +10279,18 @@ static td_t* exec_shortest_path(td_graph_t* g, td_op_t* op,
     if (td_is_atom(src_val)) {
         src_node = src_val->i64;
     } else {
+        if (src_val->len == 0) return TD_ERR_PTR(TD_ERR_RANGE);
         src_node = ((int64_t*)td_data(src_val))[0];
     }
     if (td_is_atom(dst_val)) {
         dst_node = dst_val->i64;
     } else {
+        if (dst_val->len == 0) return TD_ERR_PTR(TD_ERR_RANGE);
         dst_node = ((int64_t*)td_data(dst_val))[0];
     }
 
-    if (src_node < 0 || src_node >= csr->n_nodes ||
-        dst_node < 0 || dst_node >= csr->n_nodes)
+    if (src_node < 0 || src_node >= bfs_n_nodes ||
+        dst_node < 0 || dst_node >= bfs_n_nodes)
         return TD_ERR_PTR(TD_ERR_RANGE);
 
     /* Special case: src == dst */
@@ -10238,9 +10298,19 @@ static td_t* exec_shortest_path(td_graph_t* g, td_op_t* op,
         td_t* v_node = td_vec_from_raw(TD_I64, &src_node, 1);
         int64_t zero = 0;
         td_t* v_depth = td_vec_from_raw(TD_I64, &zero, 1);
+        if (!v_node || TD_IS_ERR(v_node) || !v_depth || TD_IS_ERR(v_depth)) {
+            if (v_node && !TD_IS_ERR(v_node)) td_release(v_node);
+            if (v_depth && !TD_IS_ERR(v_depth)) td_release(v_depth);
+            return TD_ERR_PTR(TD_ERR_OOM);
+        }
         td_t* result = td_table_new(2);
-        result = td_table_add_col(result, td_sym_intern("_node", 5), v_node);
-        result = td_table_add_col(result, td_sym_intern("_depth", 6), v_depth);
+        if (!result || TD_IS_ERR(result)) { td_release(v_node); td_release(v_depth); return TD_ERR_PTR(TD_ERR_OOM); }
+        td_t* tmp = td_table_add_col(result, td_sym_intern("_node", 5), v_node);
+        if (!tmp || TD_IS_ERR(tmp)) { td_release(v_node); td_release(v_depth); td_release(result); return TD_ERR_PTR(TD_ERR_OOM); }
+        result = tmp;
+        tmp = td_table_add_col(result, td_sym_intern("_depth", 6), v_depth);
+        if (!tmp || TD_IS_ERR(tmp)) { td_release(v_node); td_release(v_depth); td_release(result); return TD_ERR_PTR(TD_ERR_OOM); }
+        result = tmp;
         td_release(v_node); td_release(v_depth);
         return result;
     }
@@ -10248,9 +10318,9 @@ static td_t* exec_shortest_path(td_graph_t* g, td_op_t* op,
     /* Allocate parent array (-1 = unvisited) */
     td_t* parent_hdr;
     int64_t* parent = (int64_t*)scratch_alloc(&parent_hdr,
-                                               (size_t)csr->n_nodes * sizeof(int64_t));
+                                               (size_t)bfs_n_nodes * sizeof(int64_t));
     if (!parent) return TD_ERR_PTR(TD_ERR_OOM);
-    memset(parent, 0xFF, (size_t)csr->n_nodes * sizeof(int64_t)); /* -1 */
+    memset(parent, 0xFF, (size_t)bfs_n_nodes * sizeof(int64_t)); /* -1 */
     parent[src_node] = src_node;
 
     /* BFS queue */
@@ -10266,28 +10336,33 @@ static td_t* exec_shortest_path(td_graph_t* g, td_op_t* op,
         int64_t level_end = q_end;
         for (int64_t qi = q_start; qi < level_end && !found; qi++) {
             int64_t node = queue[qi];
-            int64_t cnt;
-            int64_t* nbrs = td_csr_neighbors(csr, node, &cnt);
-            for (int64_t j = 0; j < cnt; j++) {
-                int64_t nbr = nbrs[j];
-                if (nbr < 0 || nbr >= csr->n_nodes) continue;
-                if (parent[nbr] != -1) continue;
-                parent[nbr] = node;
+            for (int ci = 0; ci < n_csrs && !found; ci++) {
+                td_csr_t* cur_csr = csrs[ci];
+                if (node < 0 || node >= cur_csr->n_nodes) continue;
+                int64_t cnt;
+                int64_t* nbrs = td_csr_neighbors(cur_csr, node, &cnt);
+                for (int64_t j = 0; j < cnt; j++) {
+                    int64_t nbr = nbrs[j];
+                    if (nbr < 0 || nbr >= bfs_n_nodes) continue;
+                    if (parent[nbr] != -1) continue;
+                    parent[nbr] = node;
 
-                if (nbr == dst_node) { found = true; break; }
+                    if (nbr == dst_node) { found = true; break; }
 
-                /* Grow queue if needed */
-                if (q_end >= q_cap) {
-                    int64_t new_cap = q_cap * 2;
-                    int64_t* new_q = (int64_t*)scratch_realloc(&queue_hdr,
-                        (size_t)q_cap * sizeof(int64_t),
-                        (size_t)new_cap * sizeof(int64_t));
-                    if (!new_q) { found = false; goto bfs_done; }
-                    queue = new_q;
-                    q_cap = new_cap;
+                    /* Grow queue if needed */
+                    if (q_end >= q_cap) {
+                        if (q_cap > INT64_MAX / 2) { found = false; goto bfs_done; }
+                        int64_t new_cap = q_cap * 2;
+                        int64_t* new_q = (int64_t*)scratch_realloc(&queue_hdr,
+                            (size_t)q_cap * sizeof(int64_t),
+                            (size_t)new_cap * sizeof(int64_t));
+                        if (!new_q) { found = false; goto bfs_done; }
+                        queue = new_q;
+                        q_cap = new_cap;
+                    }
+                    queue[q_end++] = nbr;
                 }
-                queue[q_end++] = nbr;
-            }
+            } /* end for ci (CSR directions) */
         }
         q_start = level_end;
     }
@@ -10304,11 +10379,12 @@ bfs_done:
     int64_t path_buf[256];
     int64_t path_len = 0;
     int64_t cur = dst_node;
-    while (cur != src_node && path_len < 256) {
+    while (cur != src_node && path_len < 255) {
         path_buf[path_len++] = cur;
         cur = parent[cur];
     }
-    path_buf[path_len++] = src_node;
+    if (path_len < 256)
+        path_buf[path_len++] = src_node;
     scratch_free(parent_hdr);
 
     /* Reverse path */
@@ -10333,8 +10409,13 @@ bfs_done:
     int64_t node_sym  = td_sym_intern("_node", 5);
     int64_t depth_sym = td_sym_intern("_depth", 6);
     td_t* result = td_table_new(2);
-    result = td_table_add_col(result, node_sym,  v_node);
-    result = td_table_add_col(result, depth_sym, v_depth);
+    if (!result || TD_IS_ERR(result)) { td_release(v_node); td_release(v_depth); return TD_ERR_PTR(TD_ERR_OOM); }
+    td_t* tmp = td_table_add_col(result, node_sym, v_node);
+    if (!tmp || TD_IS_ERR(tmp)) { td_release(v_node); td_release(v_depth); td_release(result); return TD_ERR_PTR(TD_ERR_OOM); }
+    result = tmp;
+    tmp = td_table_add_col(result, depth_sym, v_depth);
+    if (!tmp || TD_IS_ERR(tmp)) { td_release(v_node); td_release(v_depth); td_release(result); return TD_ERR_PTR(TD_ERR_OOM); }
+    result = tmp;
     td_release(v_node); td_release(v_depth);
     return result;
 }
@@ -10348,11 +10429,12 @@ static td_t* exec_wco_join(td_graph_t* g, td_op_t* op) {
     uint8_t n_rels = ext->wco.n_rels;
     uint8_t n_vars = ext->wco.n_vars;
 
+    if (!rels || n_rels == 0) return TD_ERR_PTR(TD_ERR_SCHEMA);
     if (n_vars > LFTJ_MAX_VARS) return TD_ERR_PTR(TD_ERR_NYI);
 
     /* Validate sorted CSR */
     for (uint8_t r = 0; r < n_rels; r++) {
-        if (!rels[r]->fwd.sorted)
+        if (!rels[r] || !rels[r]->fwd.sorted)
             return TD_ERR_PTR(TD_ERR_DOMAIN);
     }
 
@@ -10414,11 +10496,18 @@ static td_t* exec_wco_join(td_graph_t* g, td_op_t* op) {
             td_release(result);
             return TD_ERR_PTR(TD_ERR_OOM);
         }
-        char name_buf[8];
+        char name_buf[12];
         int n = snprintf(name_buf, sizeof(name_buf), "_v%d", v);
         int64_t name_id = td_sym_intern(name_buf, (size_t)n);
-        result = td_table_add_col(result, name_id, vec);
+        td_t* new_result = td_table_add_col(result, name_id, vec);
         td_release(vec);
+        if (!new_result || TD_IS_ERR(new_result)) {
+            for (uint8_t j = v + 1; j < n_vars; j++) td_free(ctx.buf_hdrs[j]);
+            scratch_free(col_data_block);
+            td_release(result);
+            return TD_ERR_PTR(TD_ERR_OOM);
+        }
+        result = new_result;
     }
 
     scratch_free(col_data_block);
@@ -10634,10 +10723,13 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                     td_op_ext_t* kx = find_ext(g, gext->keys[0]->id);
                     int64_t src_sym = td_sym_intern("_src", 4);
                     if (kx && kx->base.opcode == OP_SCAN && kx->sym == src_sym) {
-                        /* Find the factorized OP_EXPAND */
+                        /* Find the factorized OP_EXPAND connected to this GROUP.
+                         * The expand must be the one whose output the GROUP
+                         * is scanning (connected via OP_SCAN inputs). */
                         for (uint32_t ei = 0; ei < g->ext_count; ei++) {
                             td_op_ext_t* ex = g->ext_nodes[ei];
-                            if (ex && g->nodes[ex->base.id].opcode == OP_EXPAND
+                            if (ex && ex->base.id < g->node_count
+                                && g->nodes[ex->base.id].opcode == OP_EXPAND
                                 && ex->graph.factorized) {
                                 td_op_t* expand_op = &g->nodes[ex->base.id];
                                 td_t* expand_result = exec_node(g, expand_op);

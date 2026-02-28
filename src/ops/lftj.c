@@ -26,15 +26,24 @@
 
 /* Grow output buffers when full. Returns false on OOM. */
 static bool lftj_grow_output(lftj_enum_ctx_t* ctx) {
-    int64_t new_cap = ctx->out_cap * 2;
+    if (ctx->out_cap > INT64_MAX / 2) return false;
+    int64_t new_cap = ctx->out_cap < 64 ? 64 : ctx->out_cap * 2;
+    /* Allocate all new blocks first (atomic: no state change on failure) */
+    td_t* new_hdrs[LFTJ_MAX_VARS];
     for (uint8_t v = 0; v < ctx->n_vars; v++) {
-        td_t* old_h = ctx->buf_hdrs[v];
-        td_t* new_h = td_alloc((size_t)new_cap * sizeof(int64_t));
-        if (!new_h) return false;
-        memcpy(td_data(new_h), ctx->col_data[v], (size_t)ctx->out_count * sizeof(int64_t));
-        td_free(old_h);
-        ctx->buf_hdrs[v] = new_h;
-        ctx->col_data[v] = (int64_t*)td_data(new_h);
+        new_hdrs[v] = td_alloc((size_t)new_cap * sizeof(int64_t));
+        if (!new_hdrs[v]) {
+            for (uint8_t j = 0; j < v; j++) td_free(new_hdrs[j]);
+            return false;
+        }
+        memcpy(td_data(new_hdrs[v]), ctx->col_data[v],
+               (size_t)ctx->out_count * sizeof(int64_t));
+    }
+    /* Commit: swap pointers (no allocation can fail past here) */
+    for (uint8_t v = 0; v < ctx->n_vars; v++) {
+        td_free(ctx->buf_hdrs[v]);
+        ctx->buf_hdrs[v] = new_hdrs[v];
+        ctx->col_data[v] = (int64_t*)td_data(new_hdrs[v]);
     }
     ctx->out_cap = new_cap;
     return true;
@@ -107,6 +116,10 @@ bool lftj_build_plan(lftj_enum_ctx_t* ctx,
     for (uint8_t r = 0; r < n_rels; r++) {
         uint8_t sv = rel_src_var[r];
         uint8_t dv = rel_dst_var[r];
+
+        /* Self-loop (sv == dv) is invalid — skip it */
+        if (sv == dv) continue;
+        if (sv >= n_vars || dv >= n_vars) return false;
 
         /* Add binding to the later-bound variable */
         if (sv < dv) {
@@ -203,7 +216,8 @@ void lftj_enumerate(lftj_enum_ctx_t* ctx, uint8_t depth) {
         int64_t n_nodes = 0;
         for (uint8_t v = 1; v < ctx->n_vars; v++) {
             for (uint8_t b = 0; b < ctx->var_plans[v].n_bindings; b++) {
-                if (ctx->var_plans[v].bindings[b].bound_var == 0) {
+                if (ctx->var_plans[v].bindings[b].bound_var == 0
+                    && ctx->var_plans[v].bindings[b].csr) {
                     int64_t nn = ctx->var_plans[v].bindings[b].csr->n_nodes;
                     if (nn > n_nodes) n_nodes = nn;
                 }
@@ -225,6 +239,7 @@ void lftj_enumerate(lftj_enum_ctx_t* ctx, uint8_t depth) {
 
     for (uint8_t b = 0; b < vp->n_bindings; b++) {
         lftj_binding_t* bind = &vp->bindings[b];
+        if (!bind->csr) return;
         int64_t parent = ctx->bound[bind->bound_var];
         if (parent < 0 || parent >= bind->csr->n_nodes) return;
         lftj_open(&iter_buf[b], bind->csr, parent);

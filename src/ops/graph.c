@@ -131,6 +131,7 @@ static td_op_ext_t* graph_alloc_ext_node_ex(td_graph_t* g, size_t extra) {
     /* Extended nodes are 64 bytes; extra bytes appended for inline arrays */
     td_op_ext_t* ext = (td_op_ext_t*)td_sys_alloc(sizeof(td_op_ext_t) + extra);
     if (!ext) return NULL;
+    memset(ext, 0, sizeof(td_op_ext_t) + extra);
 
     /* Also add a placeholder in the nodes array for ID tracking */
     if (g->node_count >= g->node_cap) {
@@ -208,9 +209,13 @@ void td_graph_free(td_graph_t* g) {
         if (ext && g->nodes[ext->base.id].opcode == OP_CONST && ext->literal) {
             td_release(ext->literal);
         }
-        /* Release runtime-built SIP bitmaps on graph expand nodes */
-        if (ext && g->nodes[ext->base.id].opcode == OP_EXPAND && ext->graph.sip_sel) {
-            td_release((td_t*)ext->graph.sip_sel);
+        /* Release runtime-built SIP bitmaps on graph traversal nodes */
+        if (ext) {
+            uint16_t oc = g->nodes[ext->base.id].opcode;
+            if ((oc == OP_EXPAND || oc == OP_VAR_EXPAND || oc == OP_SHORTEST_PATH)
+                && ext->graph.sip_sel) {
+                td_release((td_t*)ext->graph.sip_sel);
+            }
         }
     }
     /* Free extended nodes */
@@ -681,7 +686,7 @@ td_op_t* td_group(td_graph_t* g, td_op_t** keys, uint8_t n_keys,
     for (uint8_t i = 0; i < n_keys; i++)
         ext->keys[i] = &g->nodes[key_ids[i]];
     ext->agg_ops = (uint16_t*)(trail + ops_off);
-    memcpy(ext->agg_ops, agg_ops, ops_sz);
+    if (ops_sz > 0) memcpy(ext->agg_ops, agg_ops, ops_sz);
     ext->agg_ins = (td_op_t**)(trail + ins_off);
     for (uint8_t i = 0; i < n_aggs; i++)
         ext->agg_ins[i] = &g->nodes[agg_ids[i]];
@@ -1175,7 +1180,7 @@ td_op_t* td_wco_join(td_graph_t* g,
 
     /* Copy rels array into trailing bytes */
     td_rel_t** trail = (td_rel_t**)EXT_TRAIL(ext);
-    memcpy(trail, rels, (size_t)n_rels * sizeof(td_rel_t*));
+    if (n_rels > 0) memcpy(trail, rels, (size_t)n_rels * sizeof(td_rel_t*));
     ext->wco.rels = (void**)trail;
     ext->wco.n_rels = n_rels;
     ext->wco.n_vars = n_vars;

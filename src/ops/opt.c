@@ -307,13 +307,15 @@ static bool fold_unary_const(td_graph_t* g, td_op_t* node) {
     td_t* folded = NULL;
     switch (node->opcode) {
         case OP_NEG:
-            folded = is_f64 ? td_f64(-vf) : td_i64(-vi);
+            if (is_f64) folded = td_f64(-vf);
+            else if (vi == INT64_MIN) return false;  /* -INT64_MIN overflows */
+            else folded = td_i64(-vi);
             break;
         case OP_ABS:
             if (is_f64)
                 folded = td_f64(fabs(vf));
-            else
-                folded = td_i64(vi < 0 ? -vi : vi);
+            else if (vi == INT64_MIN) return false;  /* -INT64_MIN overflows */
+            else folded = td_i64(vi < 0 ? -vi : vi);
             break;
         case OP_NOT:
             folded = td_bool(is_f64 ? vf == 0.0 : vi == 0);
@@ -780,13 +782,14 @@ static void sip_pass(td_graph_t* g, td_op_t* root) {
 
     uint32_t nc = g->node_count;
 
-    /* Collect OP_EXPAND nodes in reverse order (bottom-up for chained SIP) */
+    /* Collect graph traversal nodes (bottom-up for chained SIP) */
     uint32_t expand_ids[64];
     uint32_t n_expands = 0;
     for (uint32_t i = 0; i < nc && n_expands < 64; i++) {
         td_op_t* n = &g->nodes[i];
         if (n->flags & OP_FLAG_DEAD) continue;
-        if (n->opcode != OP_EXPAND) continue;
+        if (n->opcode != OP_EXPAND && n->opcode != OP_VAR_EXPAND
+            && n->opcode != OP_SHORTEST_PATH) continue;
         expand_ids[n_expands++] = i;
     }
 
@@ -805,23 +808,7 @@ static void sip_pass(td_graph_t* g, td_op_t* root) {
          * The filter's condition restricts which target nodes pass.
          * We reverse-propagate through the CSR to mark which source
          * nodes could produce any passing target. */
-        if (consumer->opcode != OP_FILTER) {
-            /* Also detect factorized pattern: OP_EXPAND → OP_GROUP
-             * where group key is the source column */
-            if (consumer->opcode == OP_GROUP) {
-                td_op_ext_t* grp_ext = find_ext(g, consumer->id);
-                if (grp_ext && grp_ext->n_keys == 1 && grp_ext->keys[0]) {
-                    td_op_ext_t* key_ext = find_ext(g, grp_ext->keys[0]->id);
-                    if (key_ext && key_ext->base.opcode == OP_SCAN) {
-                        int64_t src_sym = td_sym_intern("_src", 4);
-                        if (key_ext->sym == src_sym) {
-                            ext->graph.factorized = 1;
-                        }
-                    }
-                }
-            }
-            continue;
-        }
+        if (consumer->opcode != OP_FILTER) continue;
 
         /* 2. Find the input scan to this expand (source side) */
         td_op_t* src_scan = NULL;

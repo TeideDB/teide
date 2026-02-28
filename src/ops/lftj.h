@@ -41,7 +41,7 @@ static inline int64_t lftj_key(td_lftj_iter_t* it) {
 }
 
 static inline bool lftj_at_end(td_lftj_iter_t* it) {
-    return it->pos >= it->end;
+    return !it->targets || it->pos >= it->end;
 }
 
 static inline void lftj_next(td_lftj_iter_t* it) {
@@ -61,6 +61,11 @@ static inline void lftj_seek(td_lftj_iter_t* it, int64_t v) {
 
 /* Open trie level: set iterator to a node's adjacency list */
 static inline void lftj_open(td_lftj_iter_t* it, td_csr_t* csr, int64_t parent) {
+    if (!csr || !csr->offsets || !csr->targets
+        || parent < 0 || parent >= csr->n_nodes) {
+        it->targets = NULL; it->start = 0; it->end = 0; it->pos = 0;
+        return;
+    }
     int64_t* o = (int64_t*)td_data(csr->offsets);
     it->targets = (int64_t*)td_data(csr->targets);
     it->start = o[parent];

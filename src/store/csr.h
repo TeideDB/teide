@@ -58,13 +58,18 @@ typedef struct td_rel {
     td_csr_t    rev;          /* dst -> src */
 } td_rel_t;
 
-/* O(1) neighbor range lookup */
+/* O(1) neighbor range lookup — caller must ensure node is in [0, n_nodes). */
 static inline int64_t td_csr_degree(td_csr_t* csr, int64_t node) {
+    if (!csr || !csr->offsets || node < 0 || node >= csr->n_nodes) return 0;
     int64_t* o = (int64_t*)td_data(csr->offsets);
     return o[node + 1] - o[node];
 }
 
 static inline int64_t* td_csr_neighbors(td_csr_t* csr, int64_t node, int64_t* out_count) {
+    if (!csr || !csr->offsets || !csr->targets || node < 0 || node >= csr->n_nodes) {
+        if (out_count) *out_count = 0;
+        return NULL;
+    }
     int64_t* o = (int64_t*)td_data(csr->offsets);
     int64_t* t = (int64_t*)td_data(csr->targets);
     *out_count = o[node + 1] - o[node];
