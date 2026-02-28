@@ -116,9 +116,8 @@ static inline int64_t td_csr_degree(td_csr_t* csr, int64_t node) {
 }
 
 static inline int64_t* td_csr_neighbors(td_csr_t* csr, int64_t node, int64_t* out_count) {
-    if (!csr || !csr->offsets || !csr->targets
-        || node < 0 || node >= csr->n_nodes) {
-        *out_count = 0; return NULL;
+    if (!csr || !csr->offsets || !csr->targets || node < 0 || node >= csr->n_nodes) {
+        if (out_count) *out_count = 0; return NULL;
     }
     int64_t* o = (int64_t*)td_data(csr->offsets);
     int64_t* t = (int64_t*)td_data(csr->targets);
@@ -382,7 +381,13 @@ static inline void lftj_open(td_lftj_iter_t* it, td_csr_t* csr, int64_t parent) 
 
 ```c
 /* Intersect k sorted iterators. Returns true + sets *out if intersection found. */
-static bool leapfrog_search(td_lftj_iter_t** iters, int k, int64_t* out) {
+bool leapfrog_search(td_lftj_iter_t** iters, int k, int64_t* out) {
+    if (k <= 0) return false;
+
+    /* Check for any exhausted iterator */
+    for (int i = 0; i < k; i++)
+        if (lftj_at_end(iters[i])) return false;
+
     /* Find initial max */
     int max_idx = 0;
     for (int i = 1; i < k; i++)
@@ -392,16 +397,17 @@ static bool leapfrog_search(td_lftj_iter_t** iters, int k, int64_t* out) {
         int64_t max_val = lftj_key(iters[max_idx]);
         int next = (max_idx + 1) % k;
 
+        lftj_seek(iters[next], max_val);
+        if (lftj_at_end(iters[next])) return false;
+
         if (lftj_key(iters[next]) == max_val) {
             /* Check all iterators agree */
             bool all_equal = true;
-            for (int i = 0; i < k; i++)
+            for (int i = 0; i < k; i++) {
                 if (lftj_key(iters[i]) != max_val) { all_equal = false; break; }
+            }
             if (all_equal) { *out = max_val; return true; }
         }
-
-        lftj_seek(iters[next], max_val);
-        if (lftj_at_end(iters[next])) return false;
         max_idx = next;
     }
 }
@@ -567,16 +573,12 @@ The decision is communicated via flags on the OP_JOIN ext node or via separate o
 Added to `td_optimize` as a new pass, running after predicate pushdown:
 
 ```
-Existing passes:
   1. Type inference
   2. Constant folding
-  3. Predicate pushdown
-  4. CSE
+  3. SIP (sideways information passing)
+  4. Factorize (OP_EXPAND → OP_GROUP optimization)
   5. Fusion
   6. DCE
-
-New:
-  3.5  SIP (between predicate pushdown and CSE)
 ```
 
 ### 6.2 Algorithm
@@ -652,7 +654,7 @@ include/teide/td.h       Opcodes (OP_EXPAND etc.), types, DAG API, td_graph_t
 src/ops/graph.c          DAG construction (td_expand, td_var_expand, td_shortest_path, td_wco_join)
 src/ops/exec.c           Executor (exec_expand, exec_var_expand, exec_shortest_path, exec_wco_join,
                          factorized OP_EXPAND, ASP-Join)
-src/ops/opt.c            Optimizer passes (type inference, SIP, fusion, DCE)
+src/ops/opt.c            Optimizer passes (type inference, SIP, factorize, fusion, DCE)
 
 test/test_csr.c          Graph engine tests (42 tests)
 ```
