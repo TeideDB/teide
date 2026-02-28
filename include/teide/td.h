@@ -493,6 +493,7 @@ typedef struct td_op_ext {
             uint8_t   min_depth;
             uint8_t   max_depth;
             uint8_t   path_tracking;
+            uint8_t   factorized;     /* 1 = emit factorized output (fvec) */
         } graph;
         struct {  /* OP_WCO_JOIN */
             void**    rels;           /* td_rel_t** array */

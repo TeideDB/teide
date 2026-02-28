@@ -71,4 +71,59 @@ static inline void lftj_open(td_lftj_iter_t* it, td_csr_t* csr, int64_t parent) 
 /* Leapfrog search: intersect k sorted iterators */
 bool leapfrog_search(td_lftj_iter_t** iters, int k, int64_t* out);
 
+/* --------------------------------------------------------------------------
+ * General LFTJ enumeration
+ * -------------------------------------------------------------------------- */
+
+#define LFTJ_MAX_VARS 16
+#define LFTJ_MAX_ITERS_PER_VAR 8
+
+/* Binding entry: one iterator constraint on a variable.
+ * "Open CSR `csr` at the node bound to `bound_var`" */
+typedef struct lftj_binding {
+    td_csr_t* csr;           /* CSR to open (fwd or rev of some rel) */
+    uint8_t   bound_var;     /* index of already-bound variable providing the parent node */
+} lftj_binding_t;
+
+/* Per-variable binding plan */
+typedef struct lftj_var_plan {
+    lftj_binding_t bindings[LFTJ_MAX_ITERS_PER_VAR];
+    uint8_t        n_bindings;
+} lftj_var_plan_t;
+
+/* Enumeration context */
+typedef struct lftj_enum_ctx {
+    lftj_var_plan_t var_plans[LFTJ_MAX_VARS];
+    uint8_t         n_vars;
+    int64_t         bound[LFTJ_MAX_VARS];   /* currently bound values */
+
+    /* Output buffers (caller-owned, dynamically grown) */
+    int64_t**       col_data;    /* [n_vars] arrays of output values */
+    int64_t         out_count;
+    int64_t         out_cap;
+    td_t*           buf_hdrs[LFTJ_MAX_VARS]; /* scratch headers for realloc */
+    bool            oom;         /* set on allocation failure */
+} lftj_enum_ctx_t;
+
+/* Build binding plan from relationship array.
+ * Assumes variable ordering 0..n_vars-1.
+ * For each rel: rel[i] connects src_var→dst_var.
+ * The caller encodes this mapping as (src_var, dst_var) pairs.
+ * Returns true on success. */
+bool lftj_build_plan(lftj_enum_ctx_t* ctx,
+                     td_rel_t** rels, uint8_t n_rels, uint8_t n_vars,
+                     const uint8_t* rel_src_var, const uint8_t* rel_dst_var);
+
+/* Build default binding plan for simple patterns.
+ * Triangle (n_vars=3, n_rels=3): rels[0]=a→b, rels[1]=b→c, rels[2]=a→c
+ * 2-var (n_vars=2): all rels connect var 0→var 1
+ * Returns true on success, false if pattern not recognized. */
+bool lftj_build_default_plan(lftj_enum_ctx_t* ctx,
+                             td_rel_t** rels, uint8_t n_rels, uint8_t n_vars);
+
+/* Recursive backtracking enumeration.
+ * Caller must initialize ctx->col_data, out_cap, out_count=0, buf_hdrs.
+ * Populates ctx->col_data with matching tuples. */
+void lftj_enumerate(lftj_enum_ctx_t* ctx, uint8_t depth);
+
 #endif /* TD_LFTJ_H */

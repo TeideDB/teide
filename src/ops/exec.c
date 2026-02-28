@@ -7487,6 +7487,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
     td_t* l_idx_hdr = NULL;
     td_t* r_idx_hdr = NULL;
     td_t* matched_right_hdr = NULL;
+    td_t* sjoin_sel = NULL;
     td_t* ht_next_hdr;
     td_t* ht_heads_hdr;
     uint32_t* ht_next = (uint32_t*)scratch_alloc(&ht_next_hdr, (size_t)right_rows * sizeof(uint32_t));
@@ -7513,6 +7514,34 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
             join_build_fn(&bctx, 0, 0, right_rows);
     }
     CHECK_CANCEL_GOTO(pool, join_cleanup);
+
+    /* Phase 1.5: S-Join semijoin filter extraction.
+     * Build a TD_SEL bitmap of all distinct right-side key values that
+     * appear in the hash table. This can be used to skip left-side rows
+     * whose key cannot match any right-side row.
+     *
+     * Applied when: single I64 key, inner join, left side is large enough
+     * to benefit from filtering (> 2x right side). */
+    if (n_keys == 1 && join_type == 0 && l_key_vecs[0] &&
+        l_key_vecs[0]->type == TD_I64 && left_rows > right_rows * 2) {
+        /* Determine key range to size the bitmap */
+        int64_t* rk = (int64_t*)td_data(r_key_vecs[0]);
+        int64_t key_max = 0;
+        for (int64_t i = 0; i < right_rows; i++)
+            if (rk[i] > key_max) key_max = rk[i];
+
+        if (key_max < (int64_t)1 << 24) {  /* only for reasonably bounded keys */
+            sjoin_sel = td_sel_new(key_max + 1);
+            if (sjoin_sel && !TD_IS_ERR(sjoin_sel)) {
+                uint64_t* bits = (uint64_t*)td_data(sjoin_sel);
+                for (int64_t i = 0; i < right_rows; i++) {
+                    int64_t k = rk[i];
+                    if (k >= 0 && k <= key_max)
+                        TD_SEL_BIT_SET(bits, k);
+                }
+            }
+        }
+    }
 
     /* Phase 2: Parallel probe (two-pass: count → prefix-sum → fill) */
     uint32_t n_tasks = (uint32_t)((left_rows + JOIN_MORSEL - 1) / JOIN_MORSEL);
@@ -7774,6 +7803,7 @@ join_cleanup:
     scratch_free(r_idx_hdr);
     scratch_free(counts_hdr);
     scratch_free(matched_right_hdr);
+    if (sjoin_sel) td_release(sjoin_sel);
 
     return result;
 }
@@ -9650,6 +9680,59 @@ oom:
  * Graph execution functions
  * ============================================================================ */
 
+/* exec_expand_factorized: emit factorized output for expand+group fusion.
+ * Returns a table with _src (unique sources) and _count (degree per source).
+ * This avoids materializing the full (src, dst) cross-product. */
+static td_t* exec_expand_factorized(td_rel_t* rel, uint8_t direction, td_t* src_vec) {
+    int64_t n_src = src_vec->len;
+    int64_t* src_data = (int64_t*)td_data(src_vec);
+
+    /* Compute degrees for each source node */
+    td_t* out_src = td_vec_new(TD_I64, n_src > 0 ? n_src : 1);
+    td_t* out_cnt = td_vec_new(TD_I64, n_src > 0 ? n_src : 1);
+    if (!out_src || TD_IS_ERR(out_src) || !out_cnt || TD_IS_ERR(out_cnt)) {
+        if (out_src && !TD_IS_ERR(out_src)) td_release(out_src);
+        if (out_cnt && !TD_IS_ERR(out_cnt)) td_release(out_cnt);
+        return TD_ERR_PTR(TD_ERR_OOM);
+    }
+
+    int64_t* sd = (int64_t*)td_data(out_src);
+    int64_t* cd = (int64_t*)td_data(out_cnt);
+    int64_t out_len = 0;
+
+    for (int64_t i = 0; i < n_src; i++) {
+        int64_t node = src_data[i];
+        int64_t deg = 0;
+        if (direction == 0 || direction == 2) {
+            if (node >= 0 && node < rel->fwd.n_nodes)
+                deg += td_csr_degree(&rel->fwd, node);
+        }
+        if (direction == 1 || direction == 2) {
+            if (node >= 0 && node < rel->rev.n_nodes)
+                deg += td_csr_degree(&rel->rev, node);
+        }
+        if (deg > 0) {
+            sd[out_len] = node;
+            cd[out_len] = deg;
+            out_len++;
+        }
+    }
+    out_src->len = out_len;
+    out_cnt->len = out_len;
+
+    int64_t src_sym = td_sym_intern("_src", 4);
+    int64_t cnt_sym = td_sym_intern("_count", 6);
+    td_t* result = td_table_new(2);
+    if (!result || TD_IS_ERR(result)) {
+        td_release(out_src); td_release(out_cnt);
+        return TD_ERR_PTR(TD_ERR_OOM);
+    }
+    result = td_table_add_col(result, src_sym, out_src);
+    result = td_table_add_col(result, cnt_sym, out_cnt);
+    td_release(out_src); td_release(out_cnt);
+    return result;
+}
+
 /* exec_expand: 1-hop CSR neighbor expansion.
  * Count-then-fill pattern (same as exec_join). */
 static td_t* exec_expand(td_graph_t* g, td_op_t* op, td_t* src_vec) {
@@ -9658,6 +9741,10 @@ static td_t* exec_expand(td_graph_t* g, td_op_t* op, td_t* src_vec) {
 
     td_rel_t* rel = (td_rel_t*)ext->graph.rel;
     if (!rel) return TD_ERR_PTR(TD_ERR_SCHEMA);
+
+    /* Factorized mode: emit pre-aggregated degree counts */
+    if (ext->graph.factorized)
+        return exec_expand_factorized(rel, ext->graph.direction, src_vec);
 
     uint8_t direction = ext->graph.direction;
     int64_t n_src = src_vec->len;
@@ -10060,7 +10147,7 @@ bfs_done:
     return result;
 }
 
-/* exec_wco_join: Worst-Case Optimal Join via Leapfrog Triejoin */
+/* exec_wco_join: Worst-Case Optimal Join via general Leapfrog Triejoin */
 static td_t* exec_wco_join(td_graph_t* g, td_op_t* op) {
     td_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
@@ -10069,149 +10156,69 @@ static td_t* exec_wco_join(td_graph_t* g, td_op_t* op) {
     uint8_t n_rels = ext->wco.n_rels;
     uint8_t n_vars = ext->wco.n_vars;
 
+    if (n_vars > LFTJ_MAX_VARS) return TD_ERR_PTR(TD_ERR_NYI);
+
     /* Validate sorted CSR */
     for (uint8_t r = 0; r < n_rels; r++) {
         if (!rels[r]->fwd.sorted)
             return TD_ERR_PTR(TD_ERR_DOMAIN);
     }
 
-    /* For triangle pattern (n_vars=3, n_rels=3):
-     * variables: a, b, c
-     * rels[0]: a->b, rels[1]: b->c, rels[2]: c->a (or a->c)
-     *
-     * Simple triangle enumeration: iterate a, open b from r0.fwd[a],
-     * for each b open c from r1.fwd[b], seek c in r2.rev[a] */
+    /* Build binding plan */
+    lftj_enum_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    if (!lftj_build_default_plan(&ctx, rels, n_rels, n_vars))
+        return TD_ERR_PTR(TD_ERR_NYI);
 
-    /* Output buffers */
+    /* Allocate output buffers */
     int64_t out_cap = 4096;
-    td_t** col_hdrs = NULL;
-    int64_t** col_data = NULL;
-    td_t* col_hdrs_block;
     td_t* col_data_block;
-    col_hdrs = (td_t**)scratch_alloc(&col_hdrs_block, (size_t)n_vars * sizeof(td_t*));
-    col_data = (int64_t**)scratch_alloc(&col_data_block, (size_t)n_vars * sizeof(int64_t*));
-    if (!col_hdrs || !col_data) {
-        scratch_free(col_hdrs_block); scratch_free(col_data_block);
+    int64_t** col_data = (int64_t**)scratch_alloc(&col_data_block,
+                              (size_t)n_vars * sizeof(int64_t*));
+    if (!col_data) {
+        scratch_free(col_data_block);
         return TD_ERR_PTR(TD_ERR_OOM);
     }
 
-    td_t* buf_hdrs[16];
     for (uint8_t v = 0; v < n_vars; v++) {
-        col_data[v] = (int64_t*)scratch_alloc(&buf_hdrs[v], (size_t)out_cap * sizeof(int64_t));
-        if (!col_data[v]) {
-            for (uint8_t j = 0; j < v; j++) scratch_free(buf_hdrs[j]);
-            scratch_free(col_hdrs_block); scratch_free(col_data_block);
+        td_t* h = td_alloc((size_t)out_cap * sizeof(int64_t));
+        if (!h) {
+            for (uint8_t j = 0; j < v; j++) td_free(ctx.buf_hdrs[j]);
+            scratch_free(col_data_block);
             return TD_ERR_PTR(TD_ERR_OOM);
         }
-    }
-    int64_t out_count = 0;
-
-    /* Simple triangle enumeration for n_vars=3, n_rels=3 */
-    if (n_vars == 3 && n_rels == 3) {
-        td_csr_t* csr0 = &rels[0]->fwd;
-        td_csr_t* csr1 = &rels[1]->fwd;
-        td_csr_t* csr2_rev = &rels[2]->rev;  /* c->a reverse = a's c neighbors */
-
-        int64_t n_a = csr0->n_nodes;
-        for (int64_t a = 0; a < n_a; a++) {
-            td_lftj_iter_t it_ab, it_ac;
-            lftj_open(&it_ab, csr0, a);
-            lftj_open(&it_ac, csr2_rev, a);
-
-            /* Intersect b candidates (from a->b via r0) and c candidates
-             * This is simplified: for proper LFTJ we intersect at each level */
-            while (!lftj_at_end(&it_ab)) {
-                int64_t b = lftj_key(&it_ab);
-                if (b >= 0 && b < csr1->n_nodes) {
-                    td_lftj_iter_t it_bc;
-                    lftj_open(&it_bc, csr1, b);
-
-                    /* Intersect c from b->c (r1.fwd) and c from a->c (r2.rev) */
-                    td_lftj_iter_t it_ac_copy = it_ac;
-                    it_ac_copy.pos = it_ac_copy.start;
-
-                    while (!lftj_at_end(&it_bc) && !lftj_at_end(&it_ac_copy)) {
-                        int64_t c_bc = lftj_key(&it_bc);
-                        int64_t c_ac = lftj_key(&it_ac_copy);
-                        if (c_bc == c_ac) {
-                            /* Found triangle (a, b, c) */
-                            if (out_count >= out_cap) {
-                                int64_t new_cap = out_cap * 2;
-                                for (uint8_t v = 0; v < n_vars; v++) {
-                                    int64_t* nd = (int64_t*)scratch_realloc(&buf_hdrs[v],
-                                        (size_t)out_cap * sizeof(int64_t),
-                                        (size_t)new_cap * sizeof(int64_t));
-                                    if (!nd) goto wco_done;
-                                    col_data[v] = nd;
-                                }
-                                out_cap = new_cap;
-                            }
-                            col_data[0][out_count] = a;
-                            col_data[1][out_count] = b;
-                            col_data[2][out_count] = c_bc;
-                            out_count++;
-                            lftj_next(&it_bc);
-                            lftj_next(&it_ac_copy);
-                        } else if (c_bc < c_ac) {
-                            lftj_seek(&it_bc, c_ac);
-                        } else {
-                            lftj_seek(&it_ac_copy, c_bc);
-                        }
-                    }
-                }
-                lftj_next(&it_ab);
-            }
-        }
-    } else if (n_vars == 2 && n_rels >= 2) {
-        /* Intersection of 2+ edge lists for 2-variable pattern */
-        td_csr_t* csr0 = &rels[0]->fwd;
-        int64_t n_a = csr0->n_nodes;
-        for (int64_t a = 0; a < n_a; a++) {
-            /* Open iterators for each relationship at node a */
-            td_lftj_iter_t iters_buf[16];
-            td_lftj_iter_t* iters[16];
-            for (uint8_t r = 0; r < n_rels && r < 16; r++) {
-                lftj_open(&iters_buf[r], &rels[r]->fwd, a);
-                iters[r] = &iters_buf[r];
-            }
-
-            int64_t val;
-            while (leapfrog_search(iters, n_rels, &val)) {
-                if (out_count >= out_cap) {
-                    int64_t new_cap = out_cap * 2;
-                    for (uint8_t v = 0; v < n_vars; v++) {
-                        int64_t* nd = (int64_t*)scratch_realloc(&buf_hdrs[v],
-                            (size_t)out_cap * sizeof(int64_t),
-                            (size_t)new_cap * sizeof(int64_t));
-                        if (!nd) goto wco_done;
-                        col_data[v] = nd;
-                    }
-                    out_cap = new_cap;
-                }
-                col_data[0][out_count] = a;
-                col_data[1][out_count] = val;
-                out_count++;
-                /* Advance all iterators past current match */
-                for (uint8_t r = 0; r < n_rels; r++) lftj_next(iters[r]);
-            }
-        }
+        ctx.buf_hdrs[v] = h;
+        col_data[v] = (int64_t*)td_data(h);
     }
 
-wco_done:;
+    ctx.col_data = col_data;
+    ctx.out_count = 0;
+    ctx.out_cap = out_cap;
+    ctx.oom = false;
+
+    /* Run general LFTJ enumeration */
+    lftj_enumerate(&ctx, 0);
+
+    if (ctx.oom) {
+        for (uint8_t v = 0; v < n_vars; v++) td_free(ctx.buf_hdrs[v]);
+        scratch_free(col_data_block);
+        return TD_ERR_PTR(TD_ERR_OOM);
+    }
+
     /* Build output table */
     td_t* result = td_table_new(n_vars);
     if (!result || TD_IS_ERR(result)) {
-        for (uint8_t v = 0; v < n_vars; v++) scratch_free(buf_hdrs[v]);
-        scratch_free(col_hdrs_block); scratch_free(col_data_block);
+        for (uint8_t v = 0; v < n_vars; v++) td_free(ctx.buf_hdrs[v]);
+        scratch_free(col_data_block);
         return TD_ERR_PTR(TD_ERR_OOM);
     }
 
     for (uint8_t v = 0; v < n_vars; v++) {
-        td_t* vec = td_vec_from_raw(TD_I64, col_data[v], out_count);
-        scratch_free(buf_hdrs[v]);
+        td_t* vec = td_vec_from_raw(TD_I64, ctx.col_data[v], ctx.out_count);
+        td_free(ctx.buf_hdrs[v]);
         if (!vec || TD_IS_ERR(vec)) {
-            for (uint8_t j = v + 1; j < n_vars; j++) scratch_free(buf_hdrs[j]);
-            scratch_free(col_hdrs_block); scratch_free(col_data_block);
+            for (uint8_t j = v + 1; j < n_vars; j++) td_free(ctx.buf_hdrs[j]);
+            scratch_free(col_data_block);
             td_release(result);
             return TD_ERR_PTR(TD_ERR_OOM);
         }
@@ -10222,7 +10229,7 @@ wco_done:;
         td_release(vec);
     }
 
-    scratch_free(col_hdrs_block); scratch_free(col_data_block);
+    scratch_free(col_data_block);
     return result;
 }
 

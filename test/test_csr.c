@@ -435,6 +435,121 @@ static MunitResult test_multi_table(const void* params, void* data) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test: OP_WCO_JOIN (chain pattern: 3 vars, 2 rels — general LFTJ)
+ * -------------------------------------------------------------------------- */
+
+static MunitResult test_wco_join_chain(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    /* Graph: 0->1, 0->2, 1->2, 1->3, 2->3 (directed, no back edges) */
+    int64_t src_data[] = {0, 0, 1, 1, 2};
+    int64_t dst_data[] = {1, 2, 2, 3, 3};
+    int64_t n = 5;
+
+    td_t* sv = td_vec_from_raw(TD_I64, src_data, n);
+    td_t* dv = td_vec_from_raw(TD_I64, dst_data, n);
+    int64_t src_sym = td_sym_intern("src", 3);
+    int64_t dst_sym = td_sym_intern("dst", 3);
+    td_t* edges = td_table_new(2);
+    edges = td_table_add_col(edges, src_sym, sv);
+    edges = td_table_add_col(edges, dst_sym, dv);
+    td_release(sv); td_release(dv);
+
+    td_rel_t* rel = td_rel_from_edges(edges, "src", "dst", 4, 4, true);
+    munit_assert_ptr_not_null(rel);
+
+    /* Chain pattern: a->b->c with n_vars=3, n_rels=2
+     * rels[0]: a->b, rels[1]: b->c (fallback chain pattern in LFTJ) */
+    td_rel_t* rels[2] = {rel, rel};
+
+    td_graph_t* g = td_graph_new(NULL);
+    td_op_t* wco = td_wco_join(g, rels, 2, 3);
+    munit_assert_ptr_not_null(wco);
+
+    td_t* result = td_execute(g, wco);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->type, ==, TD_TABLE);
+
+    /* 2-hop paths: (0,1,2), (0,1,3), (0,2,3), (1,2,3) = 4 paths */
+    int64_t nrows = td_table_nrows(result);
+    munit_assert(nrows == 4);
+
+    /* Verify we have 3 columns: _v0, _v1, _v2 */
+    munit_assert(td_table_ncols(result) == 3);
+
+    td_release(result);
+    td_graph_free(g);
+    td_rel_free(rel);
+    td_release(edges);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* --------------------------------------------------------------------------
+ * Test: Factorized expand (degree counting)
+ * -------------------------------------------------------------------------- */
+
+static MunitResult test_expand_factorized(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    td_t* edges = make_edge_table();
+    td_rel_t* rel = td_rel_from_edges(edges, "src", "dst", 4, 4, false);
+    munit_assert_ptr_not_null(rel);
+
+    /* Expand nodes {0, 1, 2} forward — factorized should give degree counts */
+    int64_t start_data[] = {0, 1, 2};
+    td_t* start_vec = td_vec_from_raw(TD_I64, start_data, 3);
+
+    td_graph_t* g = td_graph_new(NULL);
+    td_op_t* src = td_const_vec(g, start_vec);
+    td_op_t* expand = td_expand(g, src, rel, 0);
+    munit_assert_ptr_not_null(expand);
+
+    /* Manually set factorized flag (normally done by optimizer) */
+    td_op_ext_t* ext = NULL;
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == expand->id) {
+            ext = g->ext_nodes[i];
+            break;
+        }
+    }
+    munit_assert_ptr_not_null(ext);
+    ext->graph.factorized = 1;
+
+    td_t* result = td_execute(g, expand);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->type, ==, TD_TABLE);
+
+    /* Should have 2 columns: _src and _count */
+    munit_assert(td_table_ncols(result) == 2);
+
+    int64_t cnt_sym = td_sym_intern("_count", 6);
+    td_t* cnt_col = td_table_get_col(result, cnt_sym);
+    munit_assert_ptr_not_null(cnt_col);
+
+    /* Degrees: node 0=2, node 1=2, node 2=1 */
+    int64_t* counts = (int64_t*)td_data(cnt_col);
+    int64_t total_deg = 0;
+    for (int64_t i = 0; i < cnt_col->len; i++)
+        total_deg += counts[i];
+    munit_assert(total_deg == 5);  /* 2 + 2 + 1 = 5 */
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(start_vec);
+    td_rel_free(rel);
+    td_release(edges);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* --------------------------------------------------------------------------
  * Suite definition
  * -------------------------------------------------------------------------- */
 
@@ -447,6 +562,8 @@ static MunitTest csr_tests[] = {
     { "/shortest_path",    test_shortest_path,         NULL, NULL, 0, NULL },
     { "/shortest_path_no", test_shortest_path_no_path, NULL, NULL, 0, NULL },
     { "/wco_join",         test_wco_join_triangle,     NULL, NULL, 0, NULL },
+    { "/wco_chain",        test_wco_join_chain,        NULL, NULL, 0, NULL },
+    { "/factorized",       test_expand_factorized,     NULL, NULL, 0, NULL },
     { "/multi_table",      test_multi_table,           NULL, NULL, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL },  /* terminator */
 };

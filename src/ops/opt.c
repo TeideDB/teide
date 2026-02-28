@@ -752,24 +752,131 @@ static void pass_dce(td_graph_t* g, td_op_t* root) {
  * Currently a no-op placeholder — activated when graph ops are present.
  * -------------------------------------------------------------------------- */
 
+/* Find downstream consumer of a node (first node that uses it as input) */
+static td_op_t* find_consumer(td_graph_t* g, uint32_t node_id) {
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        td_op_t* n = &g->nodes[i];
+        if (n->flags & OP_FLAG_DEAD) continue;
+        for (int j = 0; j < n->arity && j < 2; j++) {
+            if (n->inputs[j] && n->inputs[j]->id == node_id)
+                return n;
+        }
+    }
+    return NULL;
+}
+
+/* Find upstream OP_SCAN that feeds into a node via input chain */
+static td_op_t* find_upstream_scan(td_graph_t* g, td_op_t* node) {
+    if (!node) return NULL;
+    if (node->opcode == OP_SCAN) return node;
+    /* Walk input[0] chain */
+    if (node->arity > 0 && node->inputs[0])
+        return find_upstream_scan(g, node->inputs[0]);
+    return NULL;
+}
+
 static void sip_pass(td_graph_t* g, td_op_t* root) {
     if (!g || !root) return;
 
-    /* Walk DAG looking for OP_EXPAND nodes. For now, this is a simple
-     * pass that marks graph ops as reachable. Full SIP with backward
-     * TD_SEL propagation requires knowing the target table and downstream
-     * filter structure, which the planner provides. */
+    uint32_t nc = g->node_count;
+
+    /* Collect OP_EXPAND nodes in reverse order (bottom-up for chained SIP) */
+    uint32_t expand_ids[64];
+    uint32_t n_expands = 0;
+    for (uint32_t i = 0; i < nc && n_expands < 64; i++) {
+        td_op_t* n = &g->nodes[i];
+        if (n->flags & OP_FLAG_DEAD) continue;
+        if (n->opcode != OP_EXPAND) continue;
+        expand_ids[n_expands++] = i;
+    }
+
+    /* Process bottom-up (deepest expand first — process in reverse ID order
+     * since deeper nodes in the pipeline tend to have higher IDs) */
+    for (int ei = (int)n_expands - 1; ei >= 0; ei--) {
+        td_op_t* expand = &g->nodes[expand_ids[ei]];
+        td_op_ext_t* ext = find_ext(g, expand->id);
+        if (!ext || !ext->graph.rel) continue;
+
+        /* 1. Find downstream consumer — look for OP_FILTER on target side */
+        td_op_t* consumer = find_consumer(g, expand->id);
+        if (!consumer) continue;
+
+        /* If the consumer is OP_FILTER, we can extract a semijoin.
+         * The filter's condition restricts which target nodes pass.
+         * We reverse-propagate through the CSR to mark which source
+         * nodes could produce any passing target. */
+        if (consumer->opcode != OP_FILTER) {
+            /* Also detect factorized pattern: OP_EXPAND → OP_GROUP
+             * where group key is the source column */
+            if (consumer->opcode == OP_GROUP) {
+                td_op_ext_t* grp_ext = find_ext(g, consumer->id);
+                if (grp_ext && grp_ext->n_keys == 1 && grp_ext->keys[0]) {
+                    td_op_ext_t* key_ext = find_ext(g, grp_ext->keys[0]->id);
+                    if (key_ext && key_ext->base.opcode == OP_SCAN) {
+                        int64_t src_sym = td_sym_intern("_src", 4);
+                        if (key_ext->sym == src_sym) {
+                            ext->graph.factorized = 1;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        /* 2. Find the input scan to this expand (source side) */
+        td_op_t* src_scan = NULL;
+        if (expand->arity > 0 && expand->inputs[0])
+            src_scan = find_upstream_scan(g, expand->inputs[0]);
+
+        if (!src_scan) continue;
+
+        /* 3. Propagate backward: attach selection hint to the expand node.
+         * The executor will use this to build a TD_SEL bitmap at runtime
+         * by evaluating the filter condition, reverse-CSR propagating,
+         * and applying the resulting source-side selection.
+         *
+         * We store the filter node ID in the expand's ext pad bytes
+         * so the executor can find the downstream filter for runtime SIP. */
+        uint32_t filter_id = consumer->id;
+        memcpy(ext->base.pad + 2, &filter_id, sizeof(uint16_t));
+        /* pad[2..3] now holds truncated filter_id as a hint for the executor.
+         * Full runtime SIP: executor evaluates filter → TD_SEL on targets,
+         * reverse-CSR → source_sel, attaches to expand's source morsel skip. */
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Pass: Factorized detection
+ *
+ * Detect OP_EXPAND → OP_GROUP patterns where factorized execution
+ * avoids materializing the full cross-product.
+ * -------------------------------------------------------------------------- */
+static void factorize_pass(td_graph_t* g, td_op_t* root) {
+    if (!g || !root) return;
+
     uint32_t nc = g->node_count;
     for (uint32_t i = 0; i < nc; i++) {
         td_op_t* n = &g->nodes[i];
         if (n->flags & OP_FLAG_DEAD) continue;
         if (n->opcode != OP_EXPAND) continue;
 
-        /* TODO: Full SIP implementation:
-         * 1. Find downstream filter on target side
-         * 2. Evaluate filter -> TD_SEL on target table
-         * 3. Reverse-CSR: mark source nodes with passing targets
-         * 4. Attach source_sel to upstream OP_SCAN */
+        td_op_ext_t* ext = find_ext(g, n->id);
+        if (!ext || ext->graph.factorized) continue;  /* already set by SIP pass */
+
+        /* Look for immediate OP_GROUP consumer with _src as group key */
+        td_op_t* consumer = find_consumer(g, n->id);
+        if (!consumer || consumer->opcode != OP_GROUP) continue;
+
+        td_op_ext_t* grp_ext = find_ext(g, consumer->id);
+        if (!grp_ext || grp_ext->n_keys != 1 || !grp_ext->keys[0]) continue;
+
+        td_op_ext_t* key_ext = find_ext(g, grp_ext->keys[0]->id);
+        if (!key_ext || key_ext->base.opcode != OP_SCAN) continue;
+
+        int64_t src_sym = td_sym_intern("_src", 4);
+        if (key_ext->sym == src_sym) {
+            ext->graph.factorized = 1;
+        }
     }
 }
 
@@ -789,10 +896,13 @@ td_op_t* td_optimize(td_graph_t* g, td_op_t* root) {
     /* Pass 3: SIP (graph-aware sideways information passing) */
     sip_pass(g, root);
 
-    /* Pass 4: Fusion */
+    /* Pass 4: Factorized detection (OP_EXPAND → OP_GROUP optimization) */
+    factorize_pass(g, root);
+
+    /* Pass 5: Fusion */
     td_fuse_pass(g, root);
 
-    /* Pass 5: DCE */
+    /* Pass 6: DCE */
     pass_dce(g, root);
 
     /* Return root — may have been replaced during folding.
