@@ -837,11 +837,10 @@ static void sip_pass(td_graph_t* g, td_op_t* root) {
          *
          * We store the filter node ID in the expand's ext pad bytes
          * so the executor can find the downstream filter for runtime SIP. */
-        uint32_t filter_id = consumer->id;
-        memcpy(ext->base.pad + 2, &filter_id, sizeof(uint16_t));
-        /* pad[2..3] now holds truncated filter_id as a hint for the executor.
-         * Full runtime SIP: executor evaluates filter → TD_SEL on targets,
-         * reverse-CSR → source_sel, attaches to expand's source morsel skip. */
+        /* pad[2] = 1 signals the executor to build SIP bitmap at runtime.
+         * Note: pad is only 3 bytes (pad[0..2]) — do NOT write uint16_t
+         * at pad+2 as that overflows into the 'id' field at offset 8. */
+        ext->base.pad[2] = 1;
     }
 }
 

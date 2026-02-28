@@ -5484,6 +5484,62 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl,
     uint8_t n_keys = ext->n_keys;
     uint8_t n_aggs = ext->n_aggs;
 
+    /* Factorized shortcut: if input is a factorized expand result with
+     * (_src, _count) columns, and GROUP BY _src with COUNT/SUM(_count),
+     * return the pre-aggregated table directly without re-scanning. */
+    if (n_keys == 1 && n_aggs > 0 && nrows > 0) {
+        int64_t cnt_sym = td_sym_intern("_count", 6);
+        td_t* cnt_col = td_table_get_col(tbl, cnt_sym);
+        if (cnt_col && cnt_col->type == TD_I64) {
+            td_op_ext_t* key_ext = find_ext(g, ext->keys[0]->id);
+            int64_t src_sym = td_sym_intern("_src", 4);
+            if (key_ext && key_ext->base.opcode == OP_SCAN &&
+                key_ext->sym == src_sym) {
+                /* Verify all aggs are compatible with factorized data:
+                 * COUNT(*) → use _count directly
+                 * SUM(_count) → use _count directly */
+                bool all_compat = true;
+                for (uint8_t a = 0; a < n_aggs; a++) {
+                    uint16_t aop = ext->agg_ops[a];
+                    td_op_ext_t* agg_ext = find_ext(g, ext->agg_ins[a]->id);
+                    if (aop == OP_COUNT) continue;
+                    if (aop == OP_SUM && agg_ext &&
+                        agg_ext->base.opcode == OP_SCAN &&
+                        agg_ext->sym == cnt_sym) continue;
+                    all_compat = false;
+                    break;
+                }
+                if (all_compat) {
+                    /* The factorized table already has one row per group.
+                     * Build result with _src key + agg columns from _count. */
+                    td_t* src_col = td_table_get_col(tbl, src_sym);
+                    if (src_col) {
+                        int64_t out_nkeys = 1;
+                        int64_t out_ncols = out_nkeys + n_aggs;
+                        td_t* result = td_table_new((int64_t)out_ncols);
+                        if (!result || TD_IS_ERR(result))
+                            return TD_ERR_PTR(TD_ERR_OOM);
+                        td_retain(src_col);
+                        result = td_table_add_col(result, src_sym, src_col);
+                        td_release(src_col);
+                        for (uint8_t a = 0; a < n_aggs; a++) {
+                            td_retain(cnt_col);
+                            int64_t agg_name = td_sym_intern("_agg", 4);
+                            if (n_aggs > 1) {
+                                char buf[16];
+                                int n = snprintf(buf, sizeof(buf), "_agg%d", a);
+                                agg_name = td_sym_intern(buf, (size_t)n);
+                            }
+                            result = td_table_add_col(result, agg_name, cnt_col);
+                            td_release(cnt_col);
+                        }
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+
     /* Extract selection bitmap for pushdown (skip filtered rows in scan loops) */
     const uint64_t* mask = NULL;
     const uint8_t* sel_flags = NULL;
@@ -7326,6 +7382,9 @@ typedef struct {
     uint32_t ht_mask;       /* ht_cap - 1 */
     td_t**   r_key_vecs;
     uint8_t  n_keys;
+    /* ASP-Join: semijoin filter from factorized left side (NULL if N/A) */
+    uint64_t* asp_bits;
+    int64_t   asp_key_max;
 } join_build_ctx_t;
 
 static void join_build_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
@@ -7335,7 +7394,18 @@ static void join_build_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     uint32_t* restrict next  = c->ht_next;
     uint32_t mask  = c->ht_mask;
 
+    /* ASP-Join: precompute pointer for right-side build filtering */
+    uint64_t* asp_bits = c->asp_bits;
+    int64_t asp_max = c->asp_key_max;
+    int64_t* rk0 = (asp_bits && c->n_keys == 1) ? (int64_t*)td_data(c->r_key_vecs[0]) : NULL;
+
     for (int64_t r = start; r < end; r++) {
+        /* ASP-Join skip: if right key not in left-side bitmap, skip insert */
+        if (rk0 && rk0[r] >= 0 && rk0[r] <= asp_max &&
+            !TD_SEL_BIT_TEST(asp_bits, rk0[r])) {
+            next[(uint32_t)r] = JHT_EMPTY;  /* mark as unused */
+            continue;
+        }
         if (r + 8 < end) {
             uint64_t pf_h = hash_row_keys(c->r_key_vecs, c->n_keys, r + 8);
             __builtin_prefetch(&heads[(uint32_t)(pf_h & mask)], 1, 1);
@@ -7519,6 +7589,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
     td_t* r_idx_hdr = NULL;
     td_t* matched_right_hdr = NULL;
     td_t* sjoin_sel = NULL;
+    td_t* asp_sel = NULL;
     td_t* ht_next_hdr;
     td_t* ht_heads_hdr;
     uint32_t* ht_next = (uint32_t*)scratch_alloc(&ht_next_hdr, (size_t)right_rows * sizeof(uint32_t));
@@ -7531,6 +7602,37 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
     }
     memset(ht_heads, 0xFF, ht_cap * sizeof(uint32_t));  /* JHT_EMPTY = 0xFFFFFFFF */
 
+    /* Phase 0.5: ASP-Join — extract semijoin filter from factorized left side.
+     * When the left input comes from a factorized expand (_count column present),
+     * build a TD_SEL bitmap of left-side key values to skip right-side rows
+     * during hash-build whose keys can't match any left-side row. */
+    uint64_t* asp_bits = NULL;
+    int64_t asp_key_max = 0;
+    if (n_keys == 1 && join_type == 0 && l_key_vecs[0] &&
+        l_key_vecs[0]->type == TD_I64 && right_rows > left_rows * 2) {
+        int64_t cnt_sym = td_sym_intern("_count", 6);
+        td_t* cnt_col = td_table_get_col(left_table, cnt_sym);
+        if (cnt_col) {  /* left is factorized */
+            int64_t* lk = (int64_t*)td_data(l_key_vecs[0]);
+            int64_t lk_max = 0;
+            for (int64_t i = 0; i < left_rows; i++)
+                if (lk[i] > lk_max) lk_max = lk[i];
+
+            if (lk_max < (int64_t)1 << 24) {
+                asp_sel = td_sel_new(lk_max + 1);
+                if (asp_sel && !TD_IS_ERR(asp_sel)) {
+                    asp_bits = td_sel_bits(asp_sel);
+                    asp_key_max = lk_max;
+                    for (int64_t i = 0; i < left_rows; i++) {
+                        int64_t k = lk[i];
+                        if (k >= 0 && k <= lk_max)
+                            TD_SEL_BIT_SET(asp_bits, k);
+                    }
+                }
+            }
+        }
+    }
+
     {
         join_build_ctx_t bctx = {
             .ht_heads   = ht_heads,
@@ -7538,6 +7640,8 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
             .ht_mask    = ht_cap - 1,
             .r_key_vecs = r_key_vecs,
             .n_keys     = n_keys,
+            .asp_bits   = asp_bits,
+            .asp_key_max = asp_key_max,
         };
         if (pool && right_rows > TD_PARALLEL_THRESHOLD)
             td_pool_dispatch(pool, join_build_fn, &bctx, right_rows);
@@ -7845,6 +7949,7 @@ join_cleanup:
     scratch_free(counts_hdr);
     scratch_free(matched_right_hdr);
     if (sjoin_sel) td_release(sjoin_sel);
+    if (asp_sel) td_release(asp_sel);
 
     return result;
 }
@@ -9792,10 +9897,32 @@ static td_t* exec_expand(td_graph_t* g, td_op_t* op, td_t* src_vec) {
     int64_t* src_data = (int64_t*)td_data(src_vec);
 
     /* SIP runtime: check for source-side selection bitmap stored on the
-     * expand ext node (set by optimizer sip_pass or manually for testing). */
+     * expand ext node (set by optimizer sip_pass or manually for testing).
+     *
+     * If sip_sel is not pre-built but the optimizer left a filter hint in
+     * pad[2..3], build a source-side bitmap by marking all source nodes
+     * that have degree > 0 in the active CSR direction. */
     uint64_t* src_sel_bits = NULL;
     int64_t src_sel_len = 0;
     td_t* sip_sel = (td_t*)ext->graph.sip_sel;
+    if (!sip_sel) {
+        uint8_t filter_hint = ext->base.pad[2];
+        if (filter_hint > 0 && n_src > 64) {
+            /* Build SIP bitmap: mark source nodes with degree > 0 */
+            td_csr_t* csr = (direction == 1) ? &rel->rev : &rel->fwd;
+            int64_t nn = csr->n_nodes;
+            td_t* built_sel = td_sel_new(nn);
+            if (built_sel && !TD_IS_ERR(built_sel)) {
+                uint64_t* bits = td_sel_bits(built_sel);
+                for (int64_t nd = 0; nd < nn; nd++) {
+                    if (td_csr_degree(csr, nd) > 0)
+                        TD_SEL_BIT_SET(bits, nd);
+                }
+                ext->graph.sip_sel = built_sel;
+                sip_sel = built_sel;
+            }
+        }
+    }
     if (sip_sel && !TD_IS_ERR(sip_sel) && sip_sel->type == TD_SEL) {
         src_sel_bits = td_sel_bits(sip_sel);
         src_sel_len = sip_sel->len;
@@ -10495,6 +10622,43 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
         case OP_GROUP: {
             td_t* tbl = g->table;
             td_t* owned_tbl = NULL;
+
+            /* Factorized pipeline: detect OP_EXPAND (factorized) → OP_GROUP.
+             * When the group key is _src and there's a factorized expand node
+             * in the graph, execute the expand first and pipe its output as
+             * the group input table.  This connects the expand→group pipeline
+             * that would otherwise disconnect since GROUP reads g->table. */
+            {
+                td_op_ext_t* gext = find_ext(g, op->id);
+                if (gext && gext->n_keys == 1) {
+                    td_op_ext_t* kx = find_ext(g, gext->keys[0]->id);
+                    int64_t src_sym = td_sym_intern("_src", 4);
+                    if (kx && kx->base.opcode == OP_SCAN && kx->sym == src_sym) {
+                        /* Find the factorized OP_EXPAND */
+                        for (uint32_t ei = 0; ei < g->ext_count; ei++) {
+                            td_op_ext_t* ex = g->ext_nodes[ei];
+                            if (ex && g->nodes[ex->base.id].opcode == OP_EXPAND
+                                && ex->graph.factorized) {
+                                td_op_t* expand_op = &g->nodes[ex->base.id];
+                                td_t* expand_result = exec_node(g, expand_op);
+                                if (!expand_result || TD_IS_ERR(expand_result))
+                                    return expand_result;
+                                if (expand_result->type == TD_TABLE) {
+                                    td_t* saved = g->table;
+                                    g->table = expand_result;
+                                    td_t* result = exec_group(g, op, expand_result, 0);
+                                    g->table = saved;
+                                    td_release(expand_result);
+                                    return result;
+                                }
+                                td_release(expand_result);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
             /* Compact lazy selection if group-by has expression inputs.
              * Expression evaluation (expr_eval_full / exec_node) runs on
              * all nrows — with lazy filter that's the full unfiltered table.

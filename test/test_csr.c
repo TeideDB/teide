@@ -679,6 +679,214 @@ static MunitResult test_sjoin_filter(const void* params, void* data) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test: SIP bitmap auto-construction from optimizer hint
+ * -------------------------------------------------------------------------- */
+
+static MunitResult test_sip_auto_build(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    td_t* edges = make_edge_table();
+    td_rel_t* rel = td_rel_from_edges(edges, "src", "dst", 4, 4, false);
+    munit_assert_ptr_not_null(rel);
+
+    /* Use >64 source nodes to trigger SIP auto-build */
+    int64_t start_data[100];
+    for (int i = 0; i < 100; i++) start_data[i] = i % 4;
+    td_t* start_vec = td_vec_from_raw(TD_I64, start_data, 100);
+
+    /* --- Graph 1: baseline without SIP hint --- */
+    td_graph_t* g1 = td_graph_new(NULL);
+    td_op_t* src1 = td_const_vec(g1, start_vec);
+    td_op_t* expand1 = td_expand(g1, src1, rel, 0);
+
+    td_t* baseline = td_execute(g1, expand1);
+    munit_assert_false(TD_IS_ERR(baseline));
+    munit_assert_int(baseline->type, ==, TD_TABLE);
+    int64_t baseline_rows = td_table_nrows(baseline);
+    munit_assert(baseline_rows > 0);
+    td_release(baseline);
+    td_graph_free(g1);
+
+    /* --- Graph 2: with SIP hint set before execution --- */
+    td_graph_t* g2 = td_graph_new(NULL);
+    td_op_t* src2 = td_const_vec(g2, start_vec);
+    td_op_t* expand2 = td_expand(g2, src2, rel, 0);
+
+    /* Set SIP hint flag in pad[2] to trigger auto-build */
+    td_op_ext_t* ext = NULL;
+    for (uint32_t i = 0; i < g2->ext_count; i++) {
+        if (g2->ext_nodes[i] && g2->ext_nodes[i]->base.id == expand2->id) {
+            ext = g2->ext_nodes[i];
+            break;
+        }
+    }
+    munit_assert_ptr_not_null(ext);
+    ext->base.pad[2] = 1;  /* SIP hint flag */
+
+    td_t* result = td_execute(g2, expand2);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->type, ==, TD_TABLE);
+
+    /* All 4 nodes have degree > 0 — SIP should pass all, same count */
+    munit_assert(td_table_nrows(result) == baseline_rows);
+
+    /* Verify sip_sel was auto-built */
+    munit_assert_ptr_not_null(ext->graph.sip_sel);
+
+    td_release(result);
+    td_graph_free(g2);
+    td_release(start_vec);
+    td_rel_free(rel);
+    td_release(edges);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* --------------------------------------------------------------------------
+ * Test: Factorized EXPAND → GROUP pipeline (degree count shortcut)
+ * -------------------------------------------------------------------------- */
+
+static MunitResult test_factorized_group(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    td_t* edges = make_edge_table();
+    /* Graph: 0→1, 0→2, 1→2, 1→3, 2→3, 3→0
+     * Out-degrees: 0=2, 1=2, 2=1, 3=1 */
+    td_rel_t* rel = td_rel_from_edges(edges, "src", "dst", 4, 4, false);
+    munit_assert_ptr_not_null(rel);
+
+    int64_t start_data[] = {0, 1, 2, 3};
+    td_t* start_vec = td_vec_from_raw(TD_I64, start_data, 4);
+
+    td_graph_t* g = td_graph_new(NULL);
+    td_op_t* src = td_const_vec(g, start_vec);
+    td_op_t* expand = td_expand(g, src, rel, 0);
+
+    /* Set factorized flag on expand */
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == expand->id) {
+            g->ext_nodes[i]->graph.factorized = 1;
+            break;
+        }
+    }
+
+    /* Build GROUP BY _src with COUNT(*) on the expand output */
+    td_op_t* key_src = td_scan(g, "_src");
+    td_op_t* agg_cnt = td_scan(g, "_count");
+    td_op_t* keys[1] = { key_src };
+    td_op_t* agg_ins[1] = { agg_cnt };
+    uint16_t agg_ops[1] = { OP_COUNT };
+    td_op_t* group = td_group(g, keys, 1, agg_ops, agg_ins, 1);
+    munit_assert_ptr_not_null(group);
+
+    td_t* result = td_execute(g, group);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->type, ==, TD_TABLE);
+
+    /* Factorized expand produces 4 rows (one per node with deg > 0).
+     * GROUP BY _src COUNT(*) on factorized output should return 4 groups
+     * with counts = degrees [2, 2, 1, 1]. */
+    munit_assert(td_table_nrows(result) == 4);
+
+    /* Verify total count across groups == total degree (6 edges) */
+    int64_t agg_sym = td_sym_intern("_agg", 4);
+    td_t* agg_col = td_table_get_col(result, agg_sym);
+    munit_assert_ptr_not_null(agg_col);
+    int64_t* agg_data = (int64_t*)td_data(agg_col);
+    int64_t total = 0;
+    for (int64_t i = 0; i < agg_col->len; i++) total += agg_data[i];
+    munit_assert(total == 6);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(start_vec);
+    td_rel_free(rel);
+    td_release(edges);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* --------------------------------------------------------------------------
+ * Test: ASP-Join (factorized left → filtered right build)
+ * -------------------------------------------------------------------------- */
+
+static MunitResult test_asp_join(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    /* Left table: small factorized output with _src keys {2, 5, 8} */
+    int64_t lids[] = {2, 5, 8};
+    int64_t lcnts[] = {10, 20, 30};
+    td_t* left_src = td_vec_from_raw(TD_I64, lids, 3);
+    td_t* left_cnt = td_vec_from_raw(TD_I64, lcnts, 3);
+
+    int64_t id_sym = td_sym_intern("id", 2);
+    int64_t cnt_sym = td_sym_intern("_count", 6);
+    td_t* left_tbl = td_table_new(2);
+    left_tbl = td_table_add_col(left_tbl, id_sym, left_src);
+    left_tbl = td_table_add_col(left_tbl, cnt_sym, left_cnt);
+    td_release(left_src); td_release(left_cnt);
+
+    /* Right table: large, ids 0..99 — most don't match left */
+    int64_t n_right = 100;
+    td_t* right_ids = td_vec_new(TD_I64, n_right);
+    munit_assert_ptr_not_null(right_ids);
+    munit_assert_false(TD_IS_ERR(right_ids));
+    right_ids->len = n_right;
+    int64_t* rid = (int64_t*)td_data(right_ids);
+    for (int64_t i = 0; i < n_right; i++) rid[i] = i;
+
+    int64_t val_sym = td_sym_intern("val", 3);
+    td_t* right_vals = td_vec_new(TD_I64, n_right);
+    right_vals->len = n_right;
+    int64_t* rv = (int64_t*)td_data(right_vals);
+    for (int64_t i = 0; i < n_right; i++) rv[i] = i * 100;
+
+    td_t* right_tbl = td_table_new(2);
+    right_tbl = td_table_add_col(right_tbl, id_sym, right_ids);
+    right_tbl = td_table_add_col(right_tbl, val_sym, right_vals);
+    td_release(right_ids); td_release(right_vals);
+
+    /* Inner join: left (3 rows) × right (100 rows) on id
+     * ASP-Join triggers when right_rows > left_rows * 2 and left has _count */
+    td_graph_t* g = td_graph_new(left_tbl);
+    uint16_t right_id = td_graph_add_table(g, right_tbl);
+
+    td_op_t* left_tbl_op  = td_const_table(g, left_tbl);
+    td_op_t* right_tbl_op = td_const_table(g, right_tbl);
+    td_op_t* left_scan    = td_scan(g, "id");
+    td_op_t* right_scan   = td_scan_table(g, right_id, "id");
+
+    td_op_t* left_keys[1]  = { left_scan };
+    td_op_t* right_keys[1] = { right_scan };
+
+    td_op_t* join = td_join(g, left_tbl_op, left_keys, right_tbl_op, right_keys, 1, 0);
+    munit_assert_ptr_not_null(join);
+
+    td_t* result = td_execute(g, join);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->type, ==, TD_TABLE);
+
+    /* Should match exactly 3 rows (ids 2, 5, 8) */
+    munit_assert(td_table_nrows(result) == 3);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(left_tbl);
+    td_release(right_tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* --------------------------------------------------------------------------
  * Suite definition
  * -------------------------------------------------------------------------- */
 
@@ -694,7 +902,10 @@ static MunitTest csr_tests[] = {
     { "/wco_chain",        test_wco_join_chain,        NULL, NULL, 0, NULL },
     { "/factorized",       test_expand_factorized,     NULL, NULL, 0, NULL },
     { "/sip_expand",       test_sip_expand,            NULL, NULL, 0, NULL },
+    { "/sip_auto",         test_sip_auto_build,        NULL, NULL, 0, NULL },
     { "/sjoin",            test_sjoin_filter,           NULL, NULL, 0, NULL },
+    { "/asp_join",         test_asp_join,              NULL, NULL, 0, NULL },
+    { "/fact_group",       test_factorized_group,      NULL, NULL, 0, NULL },
     { "/multi_table",      test_multi_table,           NULL, NULL, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL },  /* terminator */
 };

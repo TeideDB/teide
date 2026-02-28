@@ -208,6 +208,10 @@ void td_graph_free(td_graph_t* g) {
         if (ext && g->nodes[ext->base.id].opcode == OP_CONST && ext->literal) {
             td_release(ext->literal);
         }
+        /* Release runtime-built SIP bitmaps on graph expand nodes */
+        if (ext && g->nodes[ext->base.id].opcode == OP_EXPAND && ext->graph.sip_sel) {
+            td_release((td_t*)ext->graph.sip_sel);
+        }
     }
     /* Free extended nodes */
     for (uint32_t i = 0; i < g->ext_count; i++) {
