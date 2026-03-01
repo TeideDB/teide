@@ -5522,6 +5522,8 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl,
                         td_retain(src_col);
                         result = td_table_add_col(result, src_sym, src_col);
                         td_release(src_col);
+                        if (!result || TD_IS_ERR(result))
+                            return TD_ERR_PTR(TD_ERR_OOM);
                         for (uint8_t a = 0; a < n_aggs; a++) {
                             td_retain(cnt_col);
                             int64_t agg_name = td_sym_intern("_agg", 4);
@@ -5532,6 +5534,8 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl,
                             }
                             result = td_table_add_col(result, agg_name, cnt_col);
                             td_release(cnt_col);
+                            if (!result || TD_IS_ERR(result))
+                                return TD_ERR_PTR(TD_ERR_OOM);
                         }
                         return result;
                     }
@@ -10432,9 +10436,9 @@ static td_t* exec_wco_join(td_graph_t* g, td_op_t* op) {
     if (!rels || n_rels == 0) return TD_ERR_PTR(TD_ERR_SCHEMA);
     if (n_vars > LFTJ_MAX_VARS) return TD_ERR_PTR(TD_ERR_NYI);
 
-    /* Validate sorted CSR */
+    /* Validate sorted CSR (both fwd and rev, since LFTJ may use either) */
     for (uint8_t r = 0; r < n_rels; r++) {
-        if (!rels[r] || !rels[r]->fwd.sorted)
+        if (!rels[r] || !rels[r]->fwd.sorted || !rels[r]->rev.sorted)
             return TD_ERR_PTR(TD_ERR_DOMAIN);
     }
 

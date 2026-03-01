@@ -145,7 +145,7 @@ static td_err_t csr_build_from_pairs(edge_pair_t* pairs, int64_t n_edges,
         off[i] += off[i - 1];
 
     /* Fill targets + rowmap using a position array */
-    td_t* pos_hdr = td_alloc((size_t)n_nodes * sizeof(int64_t));
+    td_t* pos_hdr = td_alloc((size_t)(n_nodes > 0 ? n_nodes : 1) * sizeof(int64_t));
     if (!pos_hdr) {
         td_release(out->offsets); out->offsets = NULL;
         td_release(out->targets); out->targets = NULL;
@@ -153,7 +153,8 @@ static td_err_t csr_build_from_pairs(edge_pair_t* pairs, int64_t n_edges,
         return TD_ERR_OOM;
     }
     int64_t* pos = (int64_t*)td_data(pos_hdr);
-    memcpy(pos, off, (size_t)n_nodes * sizeof(int64_t));
+    if (n_nodes > 0)
+        memcpy(pos, off, (size_t)n_nodes * sizeof(int64_t));
 
     for (int64_t i = 0; i < n_edges; i++) {
         int64_t key = is_reverse ? pairs[i].dst : pairs[i].src;

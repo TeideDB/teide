@@ -767,13 +767,15 @@ static td_op_t* find_consumer(td_graph_t* g, uint32_t node_id) {
     return NULL;
 }
 
-/* Find upstream OP_SCAN that feeds into a node via input chain */
+/* Find upstream OP_SCAN that feeds into a node via input chain (iterative) */
 static td_op_t* find_upstream_scan(td_graph_t* g, td_op_t* node) {
-    if (!node) return NULL;
-    if (node->opcode == OP_SCAN) return node;
-    /* Walk input[0] chain */
-    if (node->arity > 0 && node->inputs[0])
-        return find_upstream_scan(g, node->inputs[0]);
+    (void)g;
+    for (int steps = 0; node && steps < 1024; steps++) {
+        if (node->opcode == OP_SCAN) return node;
+        if (node->arity > 0 && node->inputs[0])
+            node = node->inputs[0];
+        else return NULL;
+    }
     return NULL;
 }
 

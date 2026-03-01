@@ -37,6 +37,7 @@ typedef struct td_lftj_iter {
 
 /* O(1) */
 static inline int64_t lftj_key(td_lftj_iter_t* it) {
+    if (!it->targets || it->pos >= it->end) return INT64_MAX;
     return it->targets[it->pos];
 }
 
@@ -45,11 +46,12 @@ static inline bool lftj_at_end(td_lftj_iter_t* it) {
 }
 
 static inline void lftj_next(td_lftj_iter_t* it) {
-    it->pos++;
+    if (it->pos < it->end) it->pos++;
 }
 
 /* O(log degree) - binary search within [pos, end) */
 static inline void lftj_seek(td_lftj_iter_t* it, int64_t v) {
+    if (!it->targets) { it->pos = it->end; return; }
     int64_t lo = it->pos, hi = it->end;
     while (lo < hi) {
         int64_t mid = lo + (hi - lo) / 2;
