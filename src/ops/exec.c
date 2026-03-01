@@ -5561,12 +5561,13 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl,
 
     if (n_keys > 8 || n_aggs > 8) return TD_ERR_PTR(TD_ERR_NYI);
 
-    /* Resolve key columns (VLA — n_keys ≤ 8) */
-    td_t* key_vecs[n_keys];
-    memset(key_vecs, 0, n_keys * sizeof(td_t*));
+    /* Resolve key columns (VLA — n_keys ≤ 8; use ≥1 to avoid zero-size VLA UB) */
+    uint8_t vla_keys = n_keys > 0 ? n_keys : 1;
+    td_t* key_vecs[vla_keys];
+    memset(key_vecs, 0, vla_keys * sizeof(td_t*));
 
-    uint8_t key_owned[n_keys]; /* 1 = we allocated via exec_node, must free */
-    memset(key_owned, 0, n_keys * sizeof(uint8_t));
+    uint8_t key_owned[vla_keys]; /* 1 = we allocated via exec_node, must free */
+    memset(key_owned, 0, vla_keys * sizeof(uint8_t));
     for (uint8_t k = 0; k < n_keys; k++) {
         td_op_t* key_op = ext->keys[k];
         td_op_ext_t* key_ext = find_ext(g, key_op->id);
@@ -5668,10 +5669,10 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl,
         agg_owned[a] = 1;
     }
 
-    /* Pre-compute key metadata (VLA — n_keys ≤ 8) */
-    void* key_data[n_keys];
-    int8_t key_types[n_keys];
-    uint8_t key_attrs[n_keys];
+    /* Pre-compute key metadata (VLA — n_keys ≤ 8; vla_keys ≥ 1) */
+    void* key_data[vla_keys];
+    int8_t key_types[vla_keys];
+    uint8_t key_attrs[vla_keys];
     for (uint8_t k = 0; k < n_keys; k++) {
         if (key_vecs[k]) {
             key_data[k]  = td_data(key_vecs[k]);

@@ -769,8 +769,8 @@ static td_op_t* find_consumer(td_graph_t* g, uint32_t node_id) {
 
 /* Find upstream OP_SCAN that feeds into a node via input chain (iterative) */
 static td_op_t* find_upstream_scan(td_graph_t* g, td_op_t* node) {
-    (void)g;
-    for (int steps = 0; node && steps < 1024; steps++) {
+    uint32_t limit = g ? g->node_count : 1024;
+    for (uint32_t steps = 0; node && steps < limit; steps++) {
         if (node->opcode == OP_SCAN) return node;
         if (node->arity > 0 && node->inputs[0])
             node = node->inputs[0];
