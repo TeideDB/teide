@@ -5520,10 +5520,13 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl,
                         if (!result || TD_IS_ERR(result))
                             return TD_ERR_PTR(TD_ERR_OOM);
                         td_retain(src_col);
-                        result = td_table_add_col(result, src_sym, src_col);
+                        td_t* tmp_r = td_table_add_col(result, src_sym, src_col);
                         td_release(src_col);
-                        if (!result || TD_IS_ERR(result))
+                        if (!tmp_r || TD_IS_ERR(tmp_r)) {
+                            td_release(result);
                             return TD_ERR_PTR(TD_ERR_OOM);
+                        }
+                        result = tmp_r;
                         for (uint8_t a = 0; a < n_aggs; a++) {
                             td_retain(cnt_col);
                             int64_t agg_name = td_sym_intern("_agg", 4);
@@ -5532,10 +5535,13 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl,
                                 int n = snprintf(buf, sizeof(buf), "_agg%d", a);
                                 agg_name = td_sym_intern(buf, (size_t)n);
                             }
-                            result = td_table_add_col(result, agg_name, cnt_col);
+                            tmp_r = td_table_add_col(result, agg_name, cnt_col);
                             td_release(cnt_col);
-                            if (!result || TD_IS_ERR(result))
+                            if (!tmp_r || TD_IS_ERR(tmp_r)) {
+                                td_release(result);
                                 return TD_ERR_PTR(TD_ERR_OOM);
+                            }
+                            result = tmp_r;
                         }
                         return result;
                     }
