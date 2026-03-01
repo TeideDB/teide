@@ -5586,15 +5586,16 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl,
         }
     }
 
-    /* Resolve agg input columns (VLA — n_aggs ≤ 8) */
-    td_t* agg_vecs[n_aggs];
-    uint8_t agg_owned[n_aggs]; /* 1 = we allocated via exec_node, must free */
-    agg_affine_t agg_affine[n_aggs];
-    agg_linear_t agg_linear[n_aggs];
-    memset(agg_vecs, 0, n_aggs * sizeof(td_t*));
-    memset(agg_owned, 0, n_aggs * sizeof(uint8_t));
-    memset(agg_affine, 0, n_aggs * sizeof(agg_affine_t));
-    memset(agg_linear, 0, n_aggs * sizeof(agg_linear_t));
+    /* Resolve agg input columns (VLA — n_aggs ≤ 8; use ≥1 to avoid zero-size VLA UB) */
+    uint8_t vla_aggs = n_aggs > 0 ? n_aggs : 1;
+    td_t* agg_vecs[vla_aggs];
+    uint8_t agg_owned[vla_aggs]; /* 1 = we allocated via exec_node, must free */
+    agg_affine_t agg_affine[vla_aggs];
+    agg_linear_t agg_linear[vla_aggs];
+    memset(agg_vecs, 0, vla_aggs * sizeof(td_t*));
+    memset(agg_owned, 0, vla_aggs * sizeof(uint8_t));
+    memset(agg_affine, 0, vla_aggs * sizeof(agg_affine_t));
+    memset(agg_linear, 0, vla_aggs * sizeof(agg_linear_t));
 
     for (uint8_t a = 0; a < n_aggs; a++) {
         td_op_t* agg_input_op = ext->agg_ins[a];
@@ -5698,8 +5699,8 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl,
             else if (aop == OP_MAX) need_flags |= DA_NEED_MAX;
         }
 
-        void* agg_ptrs[n_aggs];
-        int8_t agg_types[n_aggs];
+        void* agg_ptrs[vla_aggs];
+        int8_t agg_types[vla_aggs];
         for (uint8_t a = 0; a < n_aggs; a++) {
             if (agg_vecs[a]) {
                 agg_ptrs[a]  = td_data(agg_vecs[a]);
@@ -5992,8 +5993,8 @@ da_path:;
             uint32_t n_slots = (uint32_t)total_slots;
             size_t total = (size_t)n_slots * n_aggs;
 
-            void* agg_ptrs[n_aggs];
-            int8_t agg_types[n_aggs];
+            void* agg_ptrs[vla_aggs];
+            int8_t agg_types[vla_aggs];
             uint32_t agg_f64_mask = 0;
             for (uint8_t a = 0; a < n_aggs; a++) {
                 if (agg_vecs[a]) {
