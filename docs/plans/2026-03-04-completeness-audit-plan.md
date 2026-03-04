@@ -1135,7 +1135,7 @@ git commit -m "test: add test_sel.c with 4 selection vector tests"
 
 ---
 
-## Task 4: Add test_fvec.c — factorized vector tests
+## Task 4: Add test_fvec.c — factorized vector tests [x]
 
 **Files:**
 - Create: `test/test_fvec.c`

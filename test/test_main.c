@@ -53,6 +53,7 @@ extern MunitSuite test_opt_suite;
 extern MunitSuite test_exec_suite;
 extern MunitSuite test_csv_suite;
 extern MunitSuite test_sel_suite;
+extern MunitSuite test_fvec_suite;
 
 static MunitSuite child_suites[] = {
     /* { .prefix, .tests, .suites, .iterations, .options } */
@@ -75,6 +76,7 @@ static MunitSuite child_suites[] = {
     { "/exec",   NULL, NULL, 0, 0 },
     { "/csv",    NULL, NULL, 0, 0 },
     { "/sel",    NULL, NULL, 0, 0 },
+    { "/fvec",   NULL, NULL, 0, 0 },
     { NULL, NULL, NULL, 0, 0 },        /* terminator */
 };
 
@@ -107,6 +109,7 @@ int main(int argc, char* argv[]) {
     child_suites[16] = test_exec_suite;
     child_suites[17] = test_csv_suite;
     child_suites[18] = test_sel_suite;
+    child_suites[19] = test_fvec_suite;
 
     return munit_suite_main(&root_suite, NULL, argc, argv);
 }
