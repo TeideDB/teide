@@ -86,7 +86,7 @@ git commit -m "test: add test_opt.c skeleton for optimizer pass tests"
 
 ---
 
-### Task 2: Filter reordering — failing tests
+### Task 2: Filter reordering — failing tests [x]
 
 **Files:**
 - Modify: `test/test_opt.c`
