@@ -1665,6 +1665,10 @@ static td_t* exec_count_distinct(td_graph_t* g, td_op_t* op, td_t* input) {
 
     if (len == 0) return td_i64(0);
 
+    /* Only numeric/ordinal column types are supported */
+    if (in_type <= 0 || in_type == TD_TABLE)
+        return TD_ERR_PTR(TD_ERR_TYPE);
+
     /* Use a simple open-addressing hash set for int64 values */
     int64_t cap = len < 16 ? 32 : len * 2;
     /* Round up to power of 2 */
