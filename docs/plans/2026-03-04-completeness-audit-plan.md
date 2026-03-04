@@ -1248,7 +1248,7 @@ git commit -m "test: add test_fvec.c with 3 factorized vector tests"
 
 ---
 
-## Task 5: Add test_lftj.c — Leapfrog TrieJoin tests
+## Task 5: Add test_lftj.c — Leapfrog TrieJoin tests [x]
 
 **Files:**
 - Create: `test/test_lftj.c`
