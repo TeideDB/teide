@@ -118,9 +118,67 @@ static MunitResult test_filter_and_split(const void* params, void* data) {
     return MUNIT_OK;
 }
 
+/*
+ * Test: verify that after optimization, the inner filter (closest to scan)
+ * has the cheaper predicate.
+ *
+ * Build: FILTER(eq_on_i64, FILTER(gt_on_f64, SCAN))
+ * eq_on_i64 costs: const(+0) + i64_width(+3) + eq(+0) = 3
+ * gt_on_f64 costs: const(+0) + f64_width(+3) + range(+2) = 5
+ *
+ * eq is cheaper, so after reorder the chain should be:
+ *   FILTER(gt_on_f64, FILTER(eq_on_i64, SCAN))
+ * i.e., outer predicate = gt_on_f64, inner predicate = eq_on_i64
+ */
+static MunitResult test_filter_reorder_dag(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+
+    td_t* tbl = make_test_table();
+    td_graph_t* g = td_graph_new(tbl);
+
+    td_op_t* v1     = td_scan(g, "v1");
+    td_op_t* id1    = td_scan(g, "id1");
+    td_op_t* v3     = td_scan(g, "v3");
+    td_op_t* c1     = td_const_i64(g, 1);
+    td_op_t* c5     = td_const_f64(g, 5.0);
+
+    td_op_t* eq_pred = td_eq(g, id1, c1);     /* cost=3: const+i64+eq */
+    td_op_t* gt_pred = td_gt(g, v3, c5);      /* cost=5: const+f64+gt */
+
+    /* Build in WRONG order: cheap eq is outer, expensive gt is inner */
+    td_op_t* filt_inner = td_filter(g, v1, gt_pred);
+    td_op_t* filt_outer = td_filter(g, filt_inner, eq_pred);
+
+    uint32_t eq_pred_id = eq_pred->id;
+    uint32_t gt_pred_id = gt_pred->id;
+
+    td_op_t* opt = td_optimize(g, filt_outer);
+    munit_assert_ptr_not_null(opt);
+
+    /* After reorder: outer should have gt (expensive), inner should have eq (cheap).
+     * The pass swaps predicates, so:
+     *   chain[0] (outer) gets the higher cost pred
+     *   chain[1] (inner) gets the lower cost pred */
+    munit_assert_int(opt->opcode, ==, OP_FILTER);
+    td_op_t* inner = opt->inputs[0];
+    munit_assert_int(inner->opcode, ==, OP_FILTER);
+
+    /* Inner pred should be eq (cheaper), outer pred should be gt (more expensive) */
+    munit_assert_int(inner->inputs[1]->id, ==, eq_pred_id);
+    munit_assert_int(opt->inputs[1]->id, ==, gt_pred_id);
+
+    td_graph_free(g);
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
 static MunitTest tests[] = {
     { "/filter_reorder_type", test_filter_reorder_by_type, NULL, NULL, 0, NULL },
     { "/filter_and_split",    test_filter_and_split,       NULL, NULL, 0, NULL },
+    { "/filter_reorder_dag",  test_filter_reorder_dag,     NULL, NULL, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL }
 };
 

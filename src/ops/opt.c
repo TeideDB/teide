@@ -1120,13 +1120,15 @@ static void pass_filter_reorder(td_graph_t* g, td_op_t* root) {
         for (int c = 0; c < chain_len; c++)
             costs[c] = filter_cost(g, chain[c]->inputs[1]);
 
-        /* Insertion sort predicates by cost (stable: preserves original
-         * order for equal costs). We swap predicates, not filter nodes. */
+        /* Insertion sort predicates by cost descending (stable: preserves
+         * original order for equal costs). Expensive predicates go to
+         * chain[0] (outer, runs last), cheap go to chain[N-1] (inner,
+         * runs first). We swap predicates, not filter nodes. */
         for (int c = 1; c < chain_len; c++) {
             td_op_t* pred = chain[c]->inputs[1];
             int cost = costs[c];
             int j = c - 1;
-            while (j >= 0 && costs[j] > cost) {
+            while (j >= 0 && costs[j] < cost) {
                 chain[j + 1]->inputs[1] = chain[j]->inputs[1];
                 g->nodes[chain[j + 1]->id].inputs[1] = chain[j]->inputs[1];
                 costs[j + 1] = costs[j];

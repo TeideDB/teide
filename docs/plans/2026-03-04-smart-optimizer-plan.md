@@ -502,7 +502,7 @@ git commit -m "feat: add filter reordering optimizer pass"
 
 ---
 
-### Task 4: Filter reordering — DAG inspection tests
+### Task 4: Filter reordering — DAG inspection tests [x]
 
 **Files:**
 - Modify: `test/test_opt.c`
