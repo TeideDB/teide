@@ -49,6 +49,7 @@ extern MunitSuite test_graph_suite;
 extern MunitSuite test_pool_suite;
 extern MunitSuite test_store_suite;
 extern MunitSuite test_csr_suite;
+extern MunitSuite test_opt_suite;
 
 static MunitSuite child_suites[] = {
     /* { .prefix, .tests, .suites, .iterations, .options } */
@@ -67,6 +68,7 @@ static MunitSuite child_suites[] = {
     { "/pool",   NULL, NULL, 0, 0 },
     { "/store",  NULL, NULL, 0, 0 },
     { "/csr",    NULL, NULL, 0, 0 },
+    { "/opt",    NULL, NULL, 0, 0 },
     { NULL, NULL, NULL, 0, 0 },        /* terminator */
 };
 
@@ -95,6 +97,7 @@ int main(int argc, char* argv[]) {
     child_suites[12] = test_pool_suite;
     child_suites[13] = test_store_suite;
     child_suites[14] = test_csr_suite;
+    child_suites[15] = test_opt_suite;
 
     return munit_suite_main(&root_suite, NULL, argc, argv);
 }

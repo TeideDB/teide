@@ -10,7 +10,7 @@
 
 ---
 
-### Task 1: Add test_opt.c skeleton and register it
+### Task 1: Add test_opt.c skeleton and register it [x]
 
 **Files:**
 - Create: `test/test_opt.c`
