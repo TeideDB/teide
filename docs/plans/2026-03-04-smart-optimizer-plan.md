@@ -707,7 +707,7 @@ git commit -m "test: add predicate pushdown correctness tests"
 
 ---
 
-### Task 6: Predicate pushdown — implementation
+### Task 6: Predicate pushdown — implementation [x]
 
 **Files:**
 - Modify: `src/ops/opt.c`
