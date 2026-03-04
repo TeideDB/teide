@@ -184,38 +184,38 @@ static MunitResult test_filter_reorder_dag(const void* params, void* data) {
  * Verify both correctness and DAG structure.
  * id1=1 rows: indices 0,1,6,9 → count=4
  */
-static MunitResult test_pushdown_past_project(const void* params, void* data) {
+static MunitResult test_pushdown_past_select(const void* params, void* data) {
     (void)params; (void)data;
     td_heap_init();
 
     td_t* tbl = make_test_table();
     td_graph_t* g = td_graph_new(tbl);
 
-    /* Build: FILTER(pred, PROJECT([id1, v1], SCAN)) */
+    /* Build: FILTER(pred, SELECT([id1, v1], SCAN)) */
     td_op_t* v1   = td_scan(g, "v1");
     td_op_t* id1  = td_scan(g, "id1");
     td_op_t* c1   = td_const_i64(g, 1);
     td_op_t* pred = td_eq(g, id1, c1);
 
-    td_op_t* proj_cols[] = { id1, v1 };
-    td_op_t* proj = td_project(g, v1, proj_cols, 2);
-    uint32_t proj_id = proj->id;
-    td_op_t* filt = td_filter(g, proj, pred);
+    td_op_t* sel_cols[] = { id1, v1 };
+    td_op_t* sel = td_select(g, v1, sel_cols, 2);
+    uint32_t sel_id = sel->id;
+    td_op_t* filt = td_filter(g, sel, pred);
 
-    /* Optimize and capture the new root (pushdown moves filter below project) */
+    /* Optimize and capture the new root (pushdown moves filter below select) */
     td_op_t* opt_root = td_optimize(g, filt);
 
-    /* Verify DAG structure: filter should have been pushed below project */
-    td_op_t* proj_after = &g->nodes[proj_id];
-    munit_assert_int(proj_after->opcode, ==, OP_PROJECT);
-    munit_assert_int(proj_after->inputs[0]->opcode, ==, OP_FILTER);
+    /* Verify DAG structure: filter should have been pushed below select */
+    td_op_t* sel_after = &g->nodes[sel_id];
+    munit_assert_int(sel_after->opcode, ==, OP_SELECT);
+    munit_assert_int(sel_after->inputs[0]->opcode, ==, OP_FILTER);
 
-    /* Verify the optimized root is the project node (filter was pushed below) */
-    munit_assert_uint(opt_root->id, ==, proj_id);
+    /* Verify the optimized root is the select node (filter was pushed below) */
+    munit_assert_uint(opt_root->id, ==, sel_id);
 
     /* Execute COUNT from the pushed-down filter to validate correctness.
-     * The filter (now below project) should still produce the right row count. */
-    td_op_t* cnt = td_count(g, proj_after->inputs[0]);
+     * The filter (now below select) should still produce the right row count. */
+    td_op_t* cnt = td_count(g, sel_after->inputs[0]);
     td_t* result = td_execute(g, cnt);
     munit_assert_false(TD_IS_ERR(result));
     munit_assert_int(result->i64, ==, 4);
@@ -281,7 +281,7 @@ static MunitTest tests[] = {
     { "/filter_reorder_type", test_filter_reorder_by_type, NULL, NULL, 0, NULL },
     { "/filter_and_split",    test_filter_and_split,       NULL, NULL, 0, NULL },
     { "/filter_reorder_dag",  test_filter_reorder_dag,     NULL, NULL, 0, NULL },
-    { "/pushdown_project",    test_pushdown_past_project,  NULL, NULL, 0, NULL },
+    { "/pushdown_select",     test_pushdown_past_select,   NULL, NULL, 0, NULL },
     { "/pushdown_group",      test_pushdown_past_group,    NULL, NULL, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL }
 };

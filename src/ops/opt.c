@@ -118,7 +118,6 @@ static void pass_type_inference(td_graph_t* g, td_op_t* root) {
                             stack[sp++] = ext->agg_ins[a]->id;
                     break;
                 case OP_SORT:
-                case OP_PROJECT:
                 case OP_SELECT:
                     for (uint8_t k = 0; k < ext->sort.n_cols; k++)
                         if (ext->sort.columns[k] && !visited[ext->sort.columns[k]->id] && sp < (int)nc)
@@ -546,7 +545,6 @@ static void pass_constant_fold(td_graph_t* g, td_op_t* root) {
                             stack[sp++] = ext->agg_ins[a]->id;
                     break;
                 case OP_SORT:
-                case OP_PROJECT:
                 case OP_SELECT:
                     for (uint8_t k = 0; k < ext->sort.n_cols; k++)
                         if (ext->sort.columns[k] && !visited[ext->sort.columns[k]->id] && sp < (int)nc)
@@ -666,7 +664,7 @@ static void mark_live(td_graph_t* g, td_op_t* root, bool* live) {
         if (n->opcode == OP_GROUP || n->opcode == OP_SORT ||
             n->opcode == OP_JOIN  || n->opcode == OP_WINDOW_JOIN ||
             n->opcode == OP_WINDOW ||
-            n->opcode == OP_PROJECT || n->opcode == OP_SELECT) {
+            n->opcode == OP_SELECT) {
             td_op_ext_t* ext = find_ext(g, nid);
             if (ext) {
                 switch (n->opcode) {
@@ -681,7 +679,6 @@ static void mark_live(td_graph_t* g, td_op_t* root, bool* live) {
                         }
                         break;
                     case OP_SORT:
-                    case OP_PROJECT:
                     case OP_SELECT:
                         for (uint8_t k = 0; k < ext->sort.n_cols; k++) {
                             if (ext->sort.columns[k] && !live[ext->sort.columns[k]->id] && sp < (int)stack_cap)
@@ -918,7 +915,6 @@ static td_op_t* graph_alloc_node_opt(td_graph_t* g) {
                                         (td_op_t*)((char*)g->ext_nodes[i]->agg_ins[a] + delta);
                             break;
                         case OP_SORT:
-                        case OP_PROJECT:
                         case OP_SELECT:
                             for (uint8_t k = 0; k < g->ext_nodes[i]->sort.n_cols; k++)
                                 if (g->ext_nodes[i]->sort.columns[k])
@@ -1176,12 +1172,12 @@ static td_op_t* pass_predicate_pushdown(td_graph_t* g, td_op_t* root) {
             td_op_t* pred  = n->inputs[1];
             if (!child || !pred) continue;
 
-            /* Push past PROJECT/SELECT/ALIAS (only if child is single-consumer,
+            /* Push past SELECT/ALIAS (only if child is single-consumer,
              * otherwise mutating child->inputs[0] would corrupt other branches) */
-            if (child->opcode == OP_PROJECT || child->opcode == OP_SELECT ||
+            if (child->opcode == OP_SELECT ||
                 child->opcode == OP_ALIAS) {
                 if (count_node_consumers(g, child->id) > 1) continue;
-                /* Swap: FILTER(pred, PROJ(x)) -> PROJ(FILTER(pred, x)) */
+                /* Swap: FILTER(pred, SELECT(x)) -> SELECT(FILTER(pred, x)) */
                 td_op_t* proj_input = child->inputs[0];
                 n->inputs[0] = proj_input;
                 child->inputs[0] = n;

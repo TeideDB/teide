@@ -1713,7 +1713,7 @@ git commit -m "feat: implement OP_COUNT_DISTINCT executor with hash-based counti
 
 ---
 
-## Task 9: Remove OP_PROJECT
+## Task 9: Remove OP_PROJECT [x]
 
 **Files:**
 - Modify: `include/teide/td.h` (remove OP_PROJECT define, td_project declaration)

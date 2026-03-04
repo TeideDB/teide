@@ -72,9 +72,6 @@ static void graph_fixup_ext_ptrs(td_graph_t* g, ptrdiff_t delta) {
                 for (uint8_t f = 0; f < ext->window.n_funcs; f++)
                     ext->window.func_inputs[f] = graph_fix_ptr(ext->window.func_inputs[f], delta);
                 break;
-            /* M5: PROJECT/SELECT intentionally alias sort union for column
-               storage — same pointer layout (columns[], n_cols). */
-            case OP_PROJECT:
             case OP_SELECT:
                 for (uint8_t k = 0; k < ext->sort.n_cols; k++)
                     ext->sort.columns[k] = graph_fix_ptr(ext->sort.columns[k], delta);
@@ -871,34 +868,6 @@ td_op_t* td_window_op(td_graph_t* g, td_op_t* table_node,
     ext->window.frame_end     = frame_end;
     ext->window.frame_start_n = frame_start_n;
     ext->window.frame_end_n   = frame_end_n;
-
-    g->nodes[ext->base.id] = ext->base;
-    return &g->nodes[ext->base.id];
-}
-
-td_op_t* td_project(td_graph_t* g, td_op_t* input,
-                     td_op_t** cols, uint8_t n_cols) {
-    uint32_t input_id = input->id;
-    uint32_t col_ids[256];
-    for (uint8_t i = 0; i < n_cols; i++) col_ids[i] = cols[i]->id;
-
-    size_t cols_sz = (size_t)n_cols * sizeof(td_op_t*);
-    td_op_ext_t* ext = graph_alloc_ext_node_ex(g, cols_sz);
-    if (!ext) return NULL;
-
-    input = &g->nodes[input_id];
-
-    ext->base.opcode = OP_PROJECT;
-    ext->base.arity = 1;
-    ext->base.inputs[0] = input;
-    ext->base.out_type = TD_TABLE;
-    ext->base.est_rows = input->est_rows;
-
-    /* Array embedded in trailing space — freed with ext node */
-    ext->sort.columns = (td_op_t**)EXT_TRAIL(ext);
-    for (uint8_t i = 0; i < n_cols; i++)
-        ext->sort.columns[i] = &g->nodes[col_ids[i]];
-    ext->sort.n_cols = n_cols;
 
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];

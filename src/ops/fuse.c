@@ -107,12 +107,12 @@ static void count_refs(td_graph_t* g, td_op_t* root, uint32_t* ref_counts) {
             }
         }
         /* H2: Count refs for ext node children (GROUP keys/aggs,
-           SORT/PROJECT/SELECT columns, JOIN keys, WINDOW inputs)
+           SORT/SELECT columns, JOIN keys, WINDOW inputs)
            so fusion ref counts are accurate. */
         if (n->opcode == OP_GROUP || n->opcode == OP_SORT ||
             n->opcode == OP_JOIN  || n->opcode == OP_WINDOW_JOIN ||
             n->opcode == OP_WINDOW ||
-            n->opcode == OP_PROJECT || n->opcode == OP_SELECT) {
+            n->opcode == OP_SELECT) {
             td_op_ext_t* ext = find_ext(g, nid);
             if (ext) {
                 switch (n->opcode) {
@@ -127,7 +127,6 @@ static void count_refs(td_graph_t* g, td_op_t* root, uint32_t* ref_counts) {
                         }
                         break;
                     case OP_SORT:
-                    case OP_PROJECT:
                     case OP_SELECT:
                         for (uint8_t k = 0; k < ext->sort.n_cols; k++) {
                             if (ext->sort.columns[k] && sp < (int)stack_cap)

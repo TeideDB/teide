@@ -379,7 +379,6 @@ static inline uint8_t td_sym_dict_width(int64_t dict_size) {
 #define OP_GROUP        62
 #define OP_JOIN         63
 #define OP_WINDOW_JOIN  64
-#define OP_PROJECT      65
 #define OP_SELECT       66
 #define OP_HEAD         67
 #define OP_TAIL         68
@@ -854,8 +853,6 @@ td_op_t* td_window_op(td_graph_t* g, td_op_t* table_node,
                        int64_t* func_params, uint8_t n_funcs,
                        uint8_t frame_type, uint8_t frame_start, uint8_t frame_end,
                        int64_t frame_start_n, int64_t frame_end_n);
-td_op_t* td_project(td_graph_t* g, td_op_t* input,
-                     td_op_t** cols, uint8_t n_cols);
 td_op_t* td_select(td_graph_t* g, td_op_t* input,
                     td_op_t** cols, uint8_t n_cols);
 td_op_t* td_head(td_graph_t* g, td_op_t* input, int64_t n);
