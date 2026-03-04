@@ -55,6 +55,11 @@ extern MunitSuite test_csv_suite;
 extern MunitSuite test_sel_suite;
 extern MunitSuite test_fvec_suite;
 extern MunitSuite test_lftj_suite;
+extern MunitSuite test_meta_suite;
+extern MunitSuite test_types_suite;
+extern MunitSuite test_platform_suite;
+extern MunitSuite test_sys_suite;
+extern MunitSuite test_pipe_suite;
 
 static MunitSuite child_suites[] = {
     /* { .prefix, .tests, .suites, .iterations, .options } */
@@ -78,7 +83,12 @@ static MunitSuite child_suites[] = {
     { "/csv",    NULL, NULL, 0, 0 },
     { "/sel",    NULL, NULL, 0, 0 },
     { "/fvec",   NULL, NULL, 0, 0 },
-    { "/lftj",   NULL, NULL, 0, 0 },
+    { "/lftj",     NULL, NULL, 0, 0 },
+    { "/meta",     NULL, NULL, 0, 0 },
+    { "/types",    NULL, NULL, 0, 0 },
+    { "/platform", NULL, NULL, 0, 0 },
+    { "/sys",      NULL, NULL, 0, 0 },
+    { "/pipe",     NULL, NULL, 0, 0 },
     { NULL, NULL, NULL, 0, 0 },        /* terminator */
 };
 
@@ -113,6 +123,11 @@ int main(int argc, char* argv[]) {
     child_suites[18] = test_sel_suite;
     child_suites[19] = test_fvec_suite;
     child_suites[20] = test_lftj_suite;
+    child_suites[21] = test_meta_suite;
+    child_suites[22] = test_types_suite;
+    child_suites[23] = test_platform_suite;
+    child_suites[24] = test_sys_suite;
+    child_suites[25] = test_pipe_suite;
 
     return munit_suite_main(&root_suite, NULL, argc, argv);
 }
