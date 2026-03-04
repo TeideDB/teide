@@ -1469,7 +1469,7 @@ git commit -m "fix: td_block_copy retains child refs for compound types"
 
 ---
 
-## Task 7: Add td_stddev/td_stddev_pop/td_var/td_var_pop API wrappers
+## Task 7: Add td_stddev/td_stddev_pop/td_var/td_var_pop API wrappers [x]
 
 **Files:**
 - Modify: `include/teide/td.h` (add declarations after line 826)

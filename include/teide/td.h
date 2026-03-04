@@ -824,6 +824,10 @@ td_op_t* td_avg(td_graph_t* g, td_op_t* a);
 td_op_t* td_first(td_graph_t* g, td_op_t* a);
 td_op_t* td_last(td_graph_t* g, td_op_t* a);
 td_op_t* td_count_distinct(td_graph_t* g, td_op_t* a);
+td_op_t* td_stddev(td_graph_t* g, td_op_t* a);
+td_op_t* td_stddev_pop(td_graph_t* g, td_op_t* a);
+td_op_t* td_var(td_graph_t* g, td_op_t* a);
+td_op_t* td_var_pop(td_graph_t* g, td_op_t* a);
 
 /* Structural ops */
 td_op_t* td_filter(td_graph_t* g, td_op_t* input, td_op_t* predicate);

@@ -805,6 +805,44 @@ static MunitResult test_exec_select(const void* params, void* data) {
     return MUNIT_OK;
 }
 
+/* ---- STDDEV / VAR ---- */
+static MunitResult test_exec_stddev(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    double vals[] = {2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0};
+    td_t* vec = td_vec_from_raw(TD_F64, vals, 8);
+    int64_t name = td_sym_intern("x", 1);
+    td_t* tbl = td_table_new(1);
+    tbl = td_table_add_col(tbl, name, vec);
+    td_release(vec);
+
+    /* VAR_POP = 4.0, STDDEV_POP = 2.0 for this dataset */
+    td_graph_t* g = td_graph_new(tbl);
+    td_op_t* x = td_scan(g, "x");
+    td_op_t* var_op = td_var_pop(g, x);
+    td_t* result = td_execute(g, var_op);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_double_equal(result->f64, 4.0, 6);
+    td_release(result);
+    td_graph_free(g);
+
+    g = td_graph_new(tbl);
+    x = td_scan(g, "x");
+    td_op_t* stddev_op = td_stddev_pop(g, x);
+    result = td_execute(g, stddev_op);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_double_equal(result->f64, 2.0, 6);
+    td_release(result);
+    td_graph_free(g);
+
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
 /* ======================================================================
  * Suite
  * ====================================================================== */
@@ -827,6 +865,7 @@ static MunitTest exec_tests[] = {
     { "/join",           test_exec_join,              NULL, NULL, 0, NULL },
     { "/window",         test_exec_window,            NULL, NULL, 0, NULL },
     { "/select",         test_exec_select,            NULL, NULL, 0, NULL },
+    { "/stddev",         test_exec_stddev,            NULL, NULL, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL }
 };
 

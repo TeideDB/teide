@@ -587,6 +587,10 @@ td_op_t* td_avg(td_graph_t* g, td_op_t* a)    { return make_unary(g, OP_AVG, a, 
 td_op_t* td_first(td_graph_t* g, td_op_t* a)  { return make_unary(g, OP_FIRST, a, a->out_type); }
 td_op_t* td_last(td_graph_t* g, td_op_t* a)   { return make_unary(g, OP_LAST, a, a->out_type); }
 td_op_t* td_count_distinct(td_graph_t* g, td_op_t* a) { return make_unary(g, OP_COUNT_DISTINCT, a, TD_I64); }
+td_op_t* td_stddev(td_graph_t* g, td_op_t* a)     { return make_unary(g, OP_STDDEV, a, TD_F64); }
+td_op_t* td_stddev_pop(td_graph_t* g, td_op_t* a)  { return make_unary(g, OP_STDDEV_POP, a, TD_F64); }
+td_op_t* td_var(td_graph_t* g, td_op_t* a)         { return make_unary(g, OP_VAR, a, TD_F64); }
+td_op_t* td_var_pop(td_graph_t* g, td_op_t* a)     { return make_unary(g, OP_VAR_POP, a, TD_F64); }
 
 /* --------------------------------------------------------------------------
  * Structural ops
