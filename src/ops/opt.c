@@ -965,6 +965,36 @@ static td_op_t* graph_alloc_node_opt(td_graph_t* g) {
     return n;
 }
 
+/* Count how many live nodes use node_id as an input.
+ * Returns the consumer count (0 if unreferenced). */
+static int count_node_consumers(td_graph_t* g, uint32_t node_id) {
+    int count = 0;
+    uint32_t nc = g->node_count;
+    for (uint32_t j = 0; j < nc; j++) {
+        td_op_t* c = &g->nodes[j];
+        if (c->flags & OP_FLAG_DEAD) continue;
+        for (int k = 0; k < c->arity && k < 2; k++) {
+            if (c->inputs[k] && c->inputs[k]->id == node_id) {
+                count++;
+                break;  /* count each consumer node once */
+            }
+        }
+    }
+    for (uint32_t j = 0; j < g->ext_count; j++) {
+        if (!g->ext_nodes[j]) continue;
+        td_op_t* c = &g->ext_nodes[j]->base;
+        if (c->flags & OP_FLAG_DEAD) continue;
+        if (c->id < nc) continue;  /* already counted in nodes[] */
+        for (int k = 0; k < c->arity && k < 2; k++) {
+            if (c->inputs[k] && c->inputs[k]->id == node_id) {
+                count++;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
 /* --------------------------------------------------------------------------
  * Pass: Predicate pushdown
  *
@@ -974,7 +1004,8 @@ static td_op_t* graph_alloc_node_opt(td_graph_t* g) {
  * -------------------------------------------------------------------------- */
 
 /* Collect all OP_SCAN node IDs referenced by a predicate subtree.
- * Returns count (max 64). */
+ * Returns count on success, -1 if traversal was truncated (stack or result
+ * overflow) — caller must treat -1 as "unknown" and skip optimisation. */
 static int collect_pred_scans(td_graph_t* g, td_op_t* pred,
                               uint32_t* scan_ids, int max) {
     if (!pred || max <= 0) return 0;
@@ -986,10 +1017,10 @@ static int collect_pred_scans(td_graph_t* g, td_op_t* pred,
 
     bool visited[4096];
     uint32_t nc = g->node_count;
-    if (nc > 4096) return 0;  /* safety: skip for huge graphs */
+    if (nc > 4096) return -1;  /* safety: skip for huge graphs */
     memset(visited, 0, nc * sizeof(bool));
 
-    while (sp > 0 && n < max) {
+    while (sp > 0) {
         uint32_t nid = stack[--sp];
         if (nid >= nc || visited[nid]) continue;
         visited[nid] = true;
@@ -997,15 +1028,107 @@ static int collect_pred_scans(td_graph_t* g, td_op_t* pred,
         if (node->flags & OP_FLAG_DEAD) continue;
 
         if (node->opcode == OP_SCAN) {
+            if (n >= max) return -1;  /* result overflow */
             scan_ids[n++] = nid;
             continue;
         }
         for (int i = 0; i < node->arity && i < 2; i++) {
-            if (node->inputs[i] && sp < 64)
+            if (node->inputs[i]) {
+                if (sp >= 64) return -1;  /* stack overflow */
                 stack[sp++] = node->inputs[i]->id;
+            }
+        }
+        /* Walk ext-stored operands for multi-input ops */
+        td_op_ext_t* ext = find_ext(g, nid);
+        if (ext) {
+            switch (node->opcode) {
+                case OP_IF:
+                case OP_SUBSTR:
+                case OP_REPLACE: {
+                    uint32_t third_id = (uint32_t)(uintptr_t)ext->literal;
+                    if (third_id < nc && !visited[third_id]) {
+                        if (sp >= 64) return -1;
+                        stack[sp++] = third_id;
+                    }
+                    break;
+                }
+                case OP_CONCAT:
+                    if (ext->sym >= 2) {
+                        int n_args = (int)ext->sym;
+                        uint32_t* trail = (uint32_t*)((char*)(ext + 1));
+                        for (int j = 2; j < n_args; j++) {
+                            uint32_t arg_id = trail[j - 2];
+                            if (arg_id < nc && !visited[arg_id]) {
+                                if (sp >= 64) return -1;
+                                stack[sp++] = arg_id;
+                            }
+                        }
+                    }
+                    break;
+                default:
+                    break;
+            }
         }
     }
     return n;
+}
+
+/* Check if target_id is reachable from start by walking inputs.
+ * Returns true if target_id is in the subgraph rooted at start. */
+static bool is_reachable_from(td_graph_t* g, td_op_t* start, uint32_t target_id) {
+    if (!start) return false;
+    if (start->id == target_id) return true;
+
+    uint32_t nc = g->node_count;
+    if (nc > 4096) return false;
+
+    bool visited[4096];
+    memset(visited, 0, nc * sizeof(bool));
+
+    uint32_t stack[64];
+    int sp = 0;
+    stack[sp++] = start->id;
+
+    while (sp > 0) {
+        uint32_t nid = stack[--sp];
+        if (nid >= nc || visited[nid]) continue;
+        visited[nid] = true;
+        if (nid == target_id) return true;
+        td_op_t* node = &g->nodes[nid];
+        if (node->flags & OP_FLAG_DEAD) continue;
+        for (int i = 0; i < node->arity && i < 2; i++) {
+            if (node->inputs[i] && sp < 64)
+                stack[sp++] = node->inputs[i]->id;
+        }
+        /* Walk ext-stored operands for multi-input ops */
+        td_op_ext_t* ext = find_ext(g, nid);
+        if (ext) {
+            switch (node->opcode) {
+                case OP_IF:
+                case OP_SUBSTR:
+                case OP_REPLACE: {
+                    uint32_t third_id = (uint32_t)(uintptr_t)ext->literal;
+                    if (third_id < nc && !visited[third_id] && sp < 64)
+                        stack[sp++] = third_id;
+                    break;
+                }
+                case OP_CONCAT:
+                    if (ext->sym >= 2) {
+                        int n_args = (int)ext->sym;
+                        uint32_t* trail = (uint32_t*)((char*)(ext + 1));
+                        for (int j = 2; j < n_args; j++) {
+                            uint32_t arg_id = trail[j - 2];
+                            if (arg_id < nc && !visited[arg_id] && sp < 64)
+                                stack[sp++] = arg_id;
+                        }
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+    return false;
 }
 
 /* Redirect all consumers of old_id to point to new_target instead.
@@ -1053,9 +1176,11 @@ static td_op_t* pass_predicate_pushdown(td_graph_t* g, td_op_t* root) {
             td_op_t* pred  = n->inputs[1];
             if (!child || !pred) continue;
 
-            /* Push past PROJECT/SELECT/ALIAS */
+            /* Push past PROJECT/SELECT/ALIAS (only if child is single-consumer,
+             * otherwise mutating child->inputs[0] would corrupt other branches) */
             if (child->opcode == OP_PROJECT || child->opcode == OP_SELECT ||
                 child->opcode == OP_ALIAS) {
+                if (count_node_consumers(g, child->id) > 1) continue;
                 /* Swap: FILTER(pred, PROJ(x)) -> PROJ(FILTER(pred, x)) */
                 td_op_t* proj_input = child->inputs[0];
                 n->inputs[0] = proj_input;
@@ -1070,18 +1195,19 @@ static td_op_t* pass_predicate_pushdown(td_graph_t* g, td_op_t* root) {
              * bypass the filter, producing wrong results. Needs executor
              * support for filtered scan propagation before enabling. */
 
-            /* Push past EXPAND (source-side predicates) */
+            /* Push past EXPAND (source-side predicates, single-consumer only) */
             if (child->opcode == OP_EXPAND) {
+                if (count_node_consumers(g, child->id) > 1) continue;
                 uint32_t scan_ids[64];
                 int n_scans = collect_pred_scans(g, pred, scan_ids, 64);
-                if (n_scans == 0) continue;
+                if (n_scans <= 0) continue;  /* 0 = no scans, -1 = truncated */
 
-                /* All scans must be reachable from the expand's input side.
-                 * Simple heuristic: check if all scans are above (lower ID than)
-                 * the expand node. */
+                /* All predicate scans must be reachable from the expand's
+                 * source input (inputs[0]).  Walk the source subtree. */
+                td_op_t* expand_src_tree = child->inputs[0];
                 bool all_source = true;
                 for (int s = 0; s < n_scans; s++) {
-                    if (scan_ids[s] >= child->id) {
+                    if (!is_reachable_from(g, expand_src_tree, scan_ids[s])) {
                         all_source = false;
                         break;
                     }
@@ -1246,6 +1372,17 @@ static td_op_t* pass_filter_reorder(td_graph_t* g, td_op_t* root) {
 
         /* Mark all as visited */
         for (int c = 0; c < chain_len; c++) visited[chain[c]->id] = true;
+
+        /* Skip reordering if any filter in the chain has multiple consumers,
+         * since swapping predicates would change semantics for other branches */
+        bool has_shared = false;
+        for (int c = 0; c < chain_len; c++) {
+            if (count_node_consumers(g, chain[c]->id) > 1) {
+                has_shared = true;
+                break;
+            }
+        }
+        if (has_shared) continue;
 
         /* Score each filter's predicate */
         int costs[64];

@@ -202,18 +202,20 @@ static MunitResult test_pushdown_past_project(const void* params, void* data) {
     uint32_t proj_id = proj->id;
     td_op_t* filt = td_filter(g, proj, pred);
 
-    /* Verify DAG structure after optimization: filter should be below project.
-     * td_optimize now correctly returns the new root (COUNT, whose input
-     * chain is COUNT -> PROJECT -> FILTER -> SCAN after pushdown). */
-    td_optimize(g, filt);
+    /* Optimize and capture the new root (pushdown moves filter below project) */
+    td_op_t* opt_root = td_optimize(g, filt);
+
+    /* Verify DAG structure: filter should have been pushed below project */
     td_op_t* proj_after = &g->nodes[proj_id];
     munit_assert_int(proj_after->opcode, ==, OP_PROJECT);
     munit_assert_int(proj_after->inputs[0]->opcode, ==, OP_FILTER);
 
-    /* Verify correctness: execute through the pushed-down filter.
-     * COUNT bypasses PROJECT (just counts filtered rows), which is
-     * sufficient to validate the filter produces correct results. */
-    td_op_t* cnt = td_count(g, filt);
+    /* Verify the optimized root is the project node (filter was pushed below) */
+    munit_assert_uint(opt_root->id, ==, proj_id);
+
+    /* Execute COUNT from the pushed-down filter to validate correctness.
+     * The filter (now below project) should still produce the right row count. */
+    td_op_t* cnt = td_count(g, proj_after->inputs[0]);
     td_t* result = td_execute(g, cnt);
     munit_assert_false(TD_IS_ERR(result));
     munit_assert_int(result->i64, ==, 4);
