@@ -52,6 +52,7 @@ static MunitResult test_sel_from_pred(const void* params, void* data) {
     munit_assert_ptr_not_null(sel);
     munit_assert_false(TD_IS_ERR(sel));
     munit_assert_int(sel->type, ==, TD_SEL);
+    munit_assert_int(td_sel_meta(sel)->total_pass, ==, 3);
 
     td_release(sel);
     td_release(bvec);
@@ -76,6 +77,8 @@ static MunitResult test_sel_and(const void* params, void* data) {
     munit_assert_ptr_not_null(sel_and);
     munit_assert_false(TD_IS_ERR(sel_and));
     munit_assert_int(sel_and->type, ==, TD_SEL);
+    /* AND of {1,1,0,0,1} and {1,0,1,0,1} = indices {0,4} -> 2 passing */
+    munit_assert_int(td_sel_meta(sel_and)->total_pass, ==, 2);
 
     td_release(sel_and);
     td_release(sel_a);

@@ -149,6 +149,19 @@ static MunitResult test_leapfrog_search(const void* params, void* data) {
     munit_assert_true(found);
     munit_assert_int(val, ==, 3);
 
+    /* Advance both iterators past 3 and find second intersection (7) */
+    a.pos = 3;  /* points to 7 in a_data */
+    b.pos = 3;  /* points to 7 in b_data */
+    found = leapfrog_search(iters, 2, &val);
+    munit_assert_true(found);
+    munit_assert_int(val, ==, 7);
+
+    /* Advance past 7 -- no more intersections */
+    a.pos = 4;  /* points to 9 */
+    b.pos = 4;  /* points to 10 */
+    found = leapfrog_search(iters, 2, &val);
+    munit_assert_false(found);
+
     td_heap_destroy();
     return MUNIT_OK;
 }

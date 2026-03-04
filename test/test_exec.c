@@ -614,6 +614,13 @@ static MunitResult test_exec_sort(const void* params, void* data) {
     munit_assert_int(result->type, ==, TD_TABLE);
     munit_assert_int(td_table_nrows(result), ==, 10);
 
+    /* Verify ascending order */
+    td_t* sorted_col = td_table_get_col_idx(result, 1); /* v1 is col 1 */
+    int64_t* sdata = (int64_t*)td_data(sorted_col);
+    for (int i = 0; i < 9; i++) {
+        munit_assert_true(sdata[i] <= sdata[i + 1]);
+    }
+
     td_release(result);
     td_graph_free(g);
 
@@ -629,6 +636,13 @@ static MunitResult test_exec_sort(const void* params, void* data) {
     munit_assert_false(TD_IS_ERR(result));
     munit_assert_int(result->type, ==, TD_TABLE);
     munit_assert_int(td_table_nrows(result), ==, 10);
+
+    /* Verify descending order */
+    sorted_col = td_table_get_col_idx(result, 1);
+    sdata = (int64_t*)td_data(sorted_col);
+    for (int i = 0; i < 9; i++) {
+        munit_assert_true(sdata[i] >= sdata[i + 1]);
+    }
 
     td_release(result);
     td_graph_free(g);
@@ -716,6 +730,8 @@ static MunitResult test_exec_join(const void* params, void* data) {
     munit_assert_int(result->type, ==, TD_TABLE);
     /* 1->1, 2->2(twice), 3->1 = 4 result rows */
     munit_assert_int(td_table_nrows(result), ==, 4);
+    /* Joined table should have columns from both sides */
+    munit_assert_true(td_table_ncols(result) >= 3);
 
     td_release(result);
     td_graph_free(g);
@@ -769,6 +785,8 @@ static MunitResult test_exec_window(const void* params, void* data) {
     munit_assert_false(TD_IS_ERR(result));
     munit_assert_int(result->type, ==, TD_TABLE);
     munit_assert_int(td_table_nrows(result), ==, 6);
+    /* Window adds a column (row_number) to the 2-col input */
+    munit_assert_true(td_table_ncols(result) >= 3);
 
     td_release(result);
     td_graph_free(g);
@@ -796,6 +814,13 @@ static MunitResult test_exec_select(const void* params, void* data) {
     munit_assert_int(result->type, ==, TD_TABLE);
     munit_assert_int(td_table_ncols(result), ==, 2);
     munit_assert_int(td_table_nrows(result), ==, 10);
+
+    /* Verify first column is v1 (I64) and has correct values */
+    td_t* c0 = td_table_get_col_idx(result, 0);
+    munit_assert_ptr_not_null(c0);
+    munit_assert_int(c0->type, ==, TD_I64);
+    int64_t* c0_data = (int64_t*)td_data(c0);
+    munit_assert_int(c0_data[0], ==, 10);
 
     td_release(result);
     td_graph_free(g);
@@ -837,6 +862,26 @@ static MunitResult test_exec_stddev(const void* params, void* data) {
     td_release(result);
     td_graph_free(g);
 
+    /* Sample variance: var_pop * n/(n-1) = 4.0 * 8/7 = 32/7 ≈ 4.571429 */
+    g = td_graph_new(tbl);
+    x = td_scan(g, "x");
+    td_op_t* var_s = td_var(g, x);
+    result = td_execute(g, var_s);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_double_equal(result->f64, 32.0 / 7.0, 5);
+    td_release(result);
+    td_graph_free(g);
+
+    /* Sample stddev: sqrt(32/7) ≈ 2.138090 */
+    g = td_graph_new(tbl);
+    x = td_scan(g, "x");
+    td_op_t* stddev_s = td_stddev(g, x);
+    result = td_execute(g, stddev_s);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_double_equal(result->f64, sqrt(32.0 / 7.0), 5);
+    td_release(result);
+    td_graph_free(g);
+
     td_release(tbl);
     td_sym_destroy();
     td_heap_destroy();
@@ -869,8 +914,26 @@ static MunitResult test_exec_count_distinct(const void* params, void* data) {
     td_release(result);
     td_graph_free(g);
 
-    /* Single value repeated → 1 distinct */
+    /* F64 column: {1.5, 2.5, 1.5, 2.5, 3.5} → 3 distinct */
     td_sym_init();
+    double fvals[] = {1.5, 2.5, 1.5, 2.5, 3.5};
+    td_t* fvec = td_vec_from_raw(TD_F64, fvals, 5);
+    int64_t fname = td_sym_intern("f", 1);
+    td_t* ftbl = td_table_new(1);
+    ftbl = td_table_add_col(ftbl, fname, fvec);
+    td_release(fvec);
+
+    g = td_graph_new(ftbl);
+    td_op_t* fop = td_scan(g, "f");
+    cd = td_count_distinct(g, fop);
+    result = td_execute(g, cd);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->i64, ==, 3);
+    td_release(result);
+    td_graph_free(g);
+    td_release(ftbl);
+
+    /* Single value repeated → 1 distinct */
     int64_t ones[] = {1, 1, 1, 1, 1};
     td_t* ones_v = td_vec_from_raw(TD_I64, ones, 5);
     int64_t name = td_sym_intern("x", 1);

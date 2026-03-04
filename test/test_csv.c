@@ -49,6 +49,14 @@ static MunitResult test_csv_roundtrip_i64(const void* params, void* data) {
     munit_assert_int(td_table_nrows(loaded), ==, 3);
     munit_assert_int(td_table_ncols(loaded), ==, 1);
 
+    /* Verify actual data values survived the roundtrip */
+    td_t* col = td_table_get_col_idx(loaded, 0);
+    munit_assert_ptr_not_null(col);
+    int64_t* loaded_data = (int64_t*)td_data(col);
+    munit_assert_int(loaded_data[0], ==, 10);
+    munit_assert_int(loaded_data[1], ==, 20);
+    munit_assert_int(loaded_data[2], ==, 30);
+
     td_release(loaded);
     td_release(tbl);
     unlink(TMP_CSV);
@@ -74,7 +82,17 @@ static MunitResult test_csv_roundtrip_f64(const void* params, void* data) {
 
     td_t* loaded = td_read_csv(TMP_CSV);
     munit_assert_false(TD_IS_ERR(loaded));
+    munit_assert_int(loaded->type, ==, TD_TABLE);
     munit_assert_int(td_table_nrows(loaded), ==, 3);
+
+    /* Verify F64 values survived the roundtrip */
+    td_t* col = td_table_get_col_idx(loaded, 0);
+    munit_assert_ptr_not_null(col);
+    munit_assert_int(col->type, ==, TD_F64);
+    double* loaded_data = (double*)td_data(col);
+    munit_assert_double_equal(loaded_data[0], 1.5, 6);
+    munit_assert_double_equal(loaded_data[1], 2.5, 6);
+    munit_assert_double_equal(loaded_data[2], 3.5, 6);
 
     td_release(loaded);
     td_release(tbl);
@@ -109,6 +127,20 @@ static MunitResult test_csv_multi_column(const void* params, void* data) {
     munit_assert_int(td_table_ncols(loaded), ==, 2);
     munit_assert_int(td_table_nrows(loaded), ==, 3);
 
+    /* Verify both columns' data values */
+    td_t* id_col = td_table_get_col_idx(loaded, 0);
+    munit_assert_ptr_not_null(id_col);
+    int64_t* id_data = (int64_t*)td_data(id_col);
+    munit_assert_int(id_data[0], ==, 1);
+    munit_assert_int(id_data[1], ==, 2);
+    munit_assert_int(id_data[2], ==, 3);
+    td_t* val_col = td_table_get_col_idx(loaded, 1);
+    munit_assert_ptr_not_null(val_col);
+    double* val_data = (double*)td_data(val_col);
+    munit_assert_double_equal(val_data[0], 10.5, 6);
+    munit_assert_double_equal(val_data[1], 20.5, 6);
+    munit_assert_double_equal(val_data[2], 30.5, 6);
+
     td_release(loaded);
     td_release(tbl);
     unlink(TMP_CSV);
@@ -124,8 +156,8 @@ static MunitResult test_csv_empty_table(const void* params, void* data) {
 
     td_t* tbl = td_table_new(0);
     td_err_t err = td_write_csv(tbl, TMP_CSV);
-    /* Writing empty table should succeed or return an error gracefully */
-    (void)err;
+    /* Empty table (0 cols) should return TD_ERR_TYPE */
+    munit_assert_int(err, ==, TD_ERR_TYPE);
 
     td_release(tbl);
     unlink(TMP_CSV);
