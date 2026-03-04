@@ -1145,7 +1145,6 @@ static td_op_t* split_and_filter(td_graph_t* g, td_op_t* filter_node) {
 
     /* Rewrite: filter_node becomes FILTER(pred_a, input) */
     filter_node->inputs[1] = pred_a;
-    g->nodes[filter_node->id] = *filter_node;
 
     /* Allocate new outer filter */
     td_op_t* outer = graph_alloc_node_opt(g);
@@ -1189,19 +1188,21 @@ static void pass_filter_reorder(td_graph_t* g, td_op_t* root) {
         if (n->arity != 2 || !n->inputs[1]) continue;
         if (n->inputs[1]->opcode != OP_AND) continue;
 
-        /* Split AND and update consumers to point to new outer */
+        /* Split AND and update consumers to point to new outer.
+         * split_and_filter may realloc g->nodes, so re-fetch n afterwards. */
+        uint32_t orig_id = i;
         td_op_t* new_outer = split_and_filter(g, n);
-        if (new_outer != n) {
+        n = &g->nodes[orig_id];  /* re-fetch after potential realloc */
+        if (new_outer->id != orig_id) {
             /* Update all consumers of old node to point to new outer */
             uint32_t new_nc = g->node_count;
             for (uint32_t j = 0; j < new_nc; j++) {
                 td_op_t* c = &g->nodes[j];
                 if (c->flags & OP_FLAG_DEAD) continue;
                 for (int k = 0; k < c->arity && k < 2; k++) {
-                    if (c->inputs[k] && c->inputs[k]->id == n->id &&
+                    if (c->inputs[k] && c->inputs[k]->id == orig_id &&
                         c->id != new_outer->id) {
                         c->inputs[k] = new_outer;
-                        g->nodes[j] = *c;
                     }
                 }
             }
@@ -1253,12 +1254,10 @@ static void pass_filter_reorder(td_graph_t* g, td_op_t* root) {
             int j = c - 1;
             while (j >= 0 && costs[j] < cost) {
                 chain[j + 1]->inputs[1] = chain[j]->inputs[1];
-                g->nodes[chain[j + 1]->id].inputs[1] = chain[j]->inputs[1];
                 costs[j + 1] = costs[j];
                 j--;
             }
             chain[j + 1]->inputs[1] = pred;
-            g->nodes[chain[j + 1]->id].inputs[1] = pred;
             costs[j + 1] = cost;
         }
     }
