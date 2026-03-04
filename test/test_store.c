@@ -742,6 +742,196 @@ static MunitResult test_col_ext_nullmap_roundtrip(const void* params, void* fixt
     return MUNIT_OK;
 }
 
+/* ---- test_col_save_load_str -------------------------------------------- */
+
+static MunitResult test_col_save_load_str(const void* params, void* fixture) {
+    (void)params; (void)fixture;
+
+    /* Build a list of 3 string atoms */
+    td_t* list = td_list_new(4);
+    munit_assert_ptr_not_null(list);
+    munit_assert_false(TD_IS_ERR(list));
+
+    td_t* s0 = td_str("hello", 5);
+    td_t* s1 = td_str("world", 5);
+    td_t* s2 = td_str("teide", 5);
+    munit_assert_false(TD_IS_ERR(s0));
+    munit_assert_false(TD_IS_ERR(s1));
+    munit_assert_false(TD_IS_ERR(s2));
+
+    list = td_list_append(list, s0);
+    list = td_list_append(list, s1);
+    list = td_list_append(list, s2);
+    munit_assert_false(TD_IS_ERR(list));
+    munit_assert_int(list->len, ==, 3);
+
+    /* Save */
+    td_err_t err = td_col_save(list, TMP_COL_PATH);
+    munit_assert_int(err, ==, TD_OK);
+
+    /* Load */
+    td_t* loaded = td_col_load(TMP_COL_PATH);
+    munit_assert_ptr_not_null(loaded);
+    munit_assert_false(TD_IS_ERR(loaded));
+
+    /* Verify */
+    munit_assert_int(loaded->type, ==, TD_LIST);
+    munit_assert_int(loaded->len, ==, 3);
+
+    td_t* l0 = td_list_get(loaded, 0);
+    td_t* l1 = td_list_get(loaded, 1);
+    td_t* l2 = td_list_get(loaded, 2);
+    munit_assert_ptr_not_null(l0);
+    munit_assert_ptr_not_null(l1);
+    munit_assert_ptr_not_null(l2);
+    munit_assert_int(l0->type, ==, TD_ATOM_STR);
+    munit_assert_int(l1->type, ==, TD_ATOM_STR);
+    munit_assert_int(l2->type, ==, TD_ATOM_STR);
+
+    munit_assert_size(td_str_len(l0), ==, 5);
+    munit_assert_size(td_str_len(l1), ==, 5);
+    munit_assert_size(td_str_len(l2), ==, 5);
+    munit_assert_string_equal(td_str_ptr(l0), "hello");
+    munit_assert_string_equal(td_str_ptr(l1), "world");
+    munit_assert_string_equal(td_str_ptr(l2), "teide");
+
+    td_release(loaded);
+    td_release(s0);
+    td_release(s1);
+    td_release(s2);
+    td_release(list);
+    unlink(TMP_COL_PATH);
+    return MUNIT_OK;
+}
+
+/* ---- test_col_save_load_list ------------------------------------------- */
+
+static MunitResult test_col_save_load_list(const void* params, void* fixture) {
+    (void)params; (void)fixture;
+
+    /* Build a list of two I64 vectors */
+    int64_t raw0[] = {10, 20, 30};
+    int64_t raw1[] = {40, 50};
+    td_t* v0 = td_vec_from_raw(TD_I64, raw0, 3);
+    td_t* v1 = td_vec_from_raw(TD_I64, raw1, 2);
+    munit_assert_false(TD_IS_ERR(v0));
+    munit_assert_false(TD_IS_ERR(v1));
+
+    td_t* list = td_list_new(4);
+    munit_assert_false(TD_IS_ERR(list));
+    list = td_list_append(list, v0);
+    list = td_list_append(list, v1);
+    munit_assert_false(TD_IS_ERR(list));
+    munit_assert_int(list->len, ==, 2);
+
+    /* Save */
+    td_err_t err = td_col_save(list, TMP_COL_PATH);
+    munit_assert_int(err, ==, TD_OK);
+
+    /* Load */
+    td_t* loaded = td_col_load(TMP_COL_PATH);
+    munit_assert_ptr_not_null(loaded);
+    munit_assert_false(TD_IS_ERR(loaded));
+
+    /* Verify */
+    munit_assert_int(loaded->type, ==, TD_LIST);
+    munit_assert_int(loaded->len, ==, 2);
+
+    td_t* lv0 = td_list_get(loaded, 0);
+    td_t* lv1 = td_list_get(loaded, 1);
+    munit_assert_ptr_not_null(lv0);
+    munit_assert_ptr_not_null(lv1);
+    munit_assert_int(lv0->type, ==, TD_I64);
+    munit_assert_int(lv1->type, ==, TD_I64);
+    munit_assert_int(lv0->len, ==, 3);
+    munit_assert_int(lv1->len, ==, 2);
+
+    int64_t* d0 = (int64_t*)td_data(lv0);
+    munit_assert_int(d0[0], ==, 10);
+    munit_assert_int(d0[1], ==, 20);
+    munit_assert_int(d0[2], ==, 30);
+
+    int64_t* d1 = (int64_t*)td_data(lv1);
+    munit_assert_int(d1[0], ==, 40);
+    munit_assert_int(d1[1], ==, 50);
+
+    td_release(loaded);
+    td_release(v0);
+    td_release(v1);
+    td_release(list);
+    unlink(TMP_COL_PATH);
+    return MUNIT_OK;
+}
+
+/* ---- test_col_save_load_table ------------------------------------------ */
+
+static MunitResult test_col_save_load_table(const void* params, void* fixture) {
+    (void)params; (void)fixture;
+
+    /* Build a 2-column table: I64 + F64 */
+    int64_t id_a = td_sym_intern("col_x", 5);
+    int64_t id_b = td_sym_intern("col_y", 5);
+
+    int64_t raw_a[] = {1, 2, 3};
+    double  raw_b[] = {1.5, 2.5, 3.5};
+    td_t* col_a = td_vec_from_raw(TD_I64, raw_a, 3);
+    td_t* col_b = td_vec_from_raw(TD_F64, raw_b, 3);
+    munit_assert_false(TD_IS_ERR(col_a));
+    munit_assert_false(TD_IS_ERR(col_b));
+
+    td_t* tbl = td_table_new(4);
+    munit_assert_false(TD_IS_ERR(tbl));
+    tbl = td_table_add_col(tbl, id_a, col_a);
+    munit_assert_false(TD_IS_ERR(tbl));
+    tbl = td_table_add_col(tbl, id_b, col_b);
+    munit_assert_false(TD_IS_ERR(tbl));
+
+    /* Save */
+    td_err_t err = td_col_save(tbl, TMP_COL_PATH);
+    munit_assert_int(err, ==, TD_OK);
+
+    /* Load */
+    td_t* loaded = td_col_load(TMP_COL_PATH);
+    munit_assert_ptr_not_null(loaded);
+    munit_assert_false(TD_IS_ERR(loaded));
+
+    /* Verify */
+    munit_assert_int(loaded->type, ==, TD_TABLE);
+    munit_assert_int(td_table_ncols(loaded), ==, 2);
+    munit_assert_int(td_table_nrows(loaded), ==, 3);
+
+    /* Verify column names */
+    munit_assert_int(td_table_col_name(loaded, 0), ==, id_a);
+    munit_assert_int(td_table_col_name(loaded, 1), ==, id_b);
+
+    /* Verify I64 column */
+    td_t* la = td_table_get_col(loaded, id_a);
+    munit_assert_ptr_not_null(la);
+    munit_assert_int(la->type, ==, TD_I64);
+    munit_assert_int(la->len, ==, 3);
+    int64_t* da = (int64_t*)td_data(la);
+    munit_assert_int(da[0], ==, 1);
+    munit_assert_int(da[1], ==, 2);
+    munit_assert_int(da[2], ==, 3);
+
+    /* Verify F64 column */
+    td_t* lb = td_table_get_col(loaded, id_b);
+    munit_assert_ptr_not_null(lb);
+    munit_assert_int(lb->type, ==, TD_F64);
+    munit_assert_int(lb->len, ==, 3);
+    double* db = (double*)td_data(lb);
+    munit_assert_double(db[0], ==, 1.5);
+    munit_assert_double(db[1], ==, 2.5);
+    munit_assert_double(db[2], ==, 3.5);
+
+    td_release(loaded);
+    td_release(col_a);
+    td_release(col_b);
+    td_release(tbl);
+    unlink(TMP_COL_PATH);
+    return MUNIT_OK;
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 static MunitTest store_tests[] = {
@@ -758,6 +948,9 @@ static MunitTest store_tests[] = {
     { "/part_open",            test_part_open,            store_setup, store_teardown, 0, NULL },
     { "/group_parted",         test_group_parted,         store_setup, store_teardown, 0, NULL },
     { "/col_ext_nullmap_roundtrip", test_col_ext_nullmap_roundtrip, store_setup, store_teardown, 0, NULL },
+    { "/col_save_load_str",   test_col_save_load_str,   store_setup, store_teardown, 0, NULL },
+    { "/col_save_load_list",  test_col_save_load_list,  store_setup, store_teardown, 0, NULL },
+    { "/col_save_load_table", test_col_save_load_table, store_setup, store_teardown, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL },
 };
 

@@ -24,6 +24,12 @@
 #include "col.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdatomic.h>
+
+/* Magic numbers for extended column formats */
+#define STR_LIST_MAGIC  0x4C525453U  /* "STRL" */
+#define LIST_MAGIC      0x4754534CU  /* "LSTG" */
+#define TABLE_MAGIC     0x4C425454U  /* "TTBL" */
 
 /* --------------------------------------------------------------------------
  * Column file format:
@@ -51,12 +57,338 @@ static bool is_serializable_type(int8_t t) {
 }
 
 /* --------------------------------------------------------------------------
+ * String list detection: TD_LIST whose elements are all TD_ATOM_STR
+ * -------------------------------------------------------------------------- */
+
+static bool is_str_list(td_t* v) {
+    if (!v || TD_IS_ERR(v)) return false;
+    if (v->type != TD_LIST) return false;
+    td_t** slots = (td_t**)td_data(v);
+    for (int64_t i = 0; i < v->len; i++) {
+        td_t* elem = slots[i];
+        if (!elem || TD_IS_ERR(elem)) return false;
+        if (elem->type != TD_ATOM_STR) return false;
+    }
+    return true;
+}
+
+/* --------------------------------------------------------------------------
+ * col_save_str_list -- serialize a list of string atoms
+ *
+ * Format: [4B magic "STRL"][8B count][for each: 4B len + data bytes]
+ * -------------------------------------------------------------------------- */
+
+static td_err_t col_save_str_list(td_t* list, FILE* f) {
+    uint32_t magic = STR_LIST_MAGIC;
+    if (fwrite(&magic, 4, 1, f) != 1) return TD_ERR_IO;
+
+    int64_t count = list->len;
+    if (fwrite(&count, 8, 1, f) != 1) return TD_ERR_IO;
+
+    td_t** slots = (td_t**)td_data(list);
+    for (int64_t i = 0; i < count; i++) {
+        td_t* s = slots[i];
+        const char* sp = td_str_ptr(s);
+        size_t slen = td_str_len(s);
+        uint32_t len32 = (uint32_t)slen;
+        if (fwrite(&len32, 4, 1, f) != 1) return TD_ERR_IO;
+        if (slen > 0 && fwrite(sp, 1, slen, f) != slen) return TD_ERR_IO;
+    }
+    return TD_OK;
+}
+
+/* --------------------------------------------------------------------------
+ * col_load_str_list -- deserialize a string list from mapped data
+ *
+ * ptr points past the 4B magic. remaining = bytes available.
+ * -------------------------------------------------------------------------- */
+
+static td_t* col_load_str_list(const uint8_t* ptr, size_t remaining) {
+    if (remaining < 8) return TD_ERR_PTR(TD_ERR_CORRUPT);
+    int64_t count;
+    memcpy(&count, ptr, 8);
+    ptr += 8; remaining -= 8;
+
+    if (count < 0 || (uint64_t)count > remaining)
+        return TD_ERR_PTR(TD_ERR_CORRUPT);
+
+    td_t* list = td_list_new(count);
+    if (!list || TD_IS_ERR(list)) return list;
+
+    for (int64_t i = 0; i < count; i++) {
+        if (remaining < 4) { td_release(list); return TD_ERR_PTR(TD_ERR_CORRUPT); }
+        uint32_t slen;
+        memcpy(&slen, ptr, 4);
+        ptr += 4; remaining -= 4;
+
+        if (slen > remaining) { td_release(list); return TD_ERR_PTR(TD_ERR_CORRUPT); }
+        td_t* s = td_str((const char*)ptr, (size_t)slen);
+        if (!s || TD_IS_ERR(s)) { td_release(list); return s; }
+        ptr += slen; remaining -= slen;
+
+        list = td_list_append(list, s);
+        td_release(s);  /* list_append retains */
+        if (!list || TD_IS_ERR(list)) return list;
+    }
+    return list;
+}
+
+/* --------------------------------------------------------------------------
+ * Recursive element serialization for generic lists and tables
+ *
+ * Recursive element format:
+ *   [1B type]
+ *   atoms (type < 0):
+ *     TD_ATOM_STR: [4B len][data bytes]
+ *     other:       [8B raw value]
+ *   vectors with is_serializable_type: [8B len][raw data]
+ *   TD_LIST: [8B count][recursive elements...]
+ *   TD_TABLE: [8B ncols][8B nrows][for each col: 8B name_sym + recursive col]
+ * -------------------------------------------------------------------------- */
+
+static td_err_t col_write_recursive(td_t* obj, FILE* f);
+
+static td_err_t col_write_recursive(td_t* obj, FILE* f) {
+    if (!obj || TD_IS_ERR(obj)) return TD_ERR_TYPE;
+
+    int8_t type = obj->type;
+    if (fwrite(&type, 1, 1, f) != 1) return TD_ERR_IO;
+
+    if (type < 0) {
+        /* Atom */
+        if (type == TD_ATOM_STR) {
+            const char* sp = td_str_ptr(obj);
+            size_t slen = td_str_len(obj);
+            uint32_t len32 = (uint32_t)slen;
+            if (fwrite(&len32, 4, 1, f) != 1) return TD_ERR_IO;
+            if (slen > 0 && fwrite(sp, 1, slen, f) != slen) return TD_ERR_IO;
+        } else {
+            /* Fixed-size atom: write 8 bytes of the value union */
+            if (fwrite(&obj->i64, 8, 1, f) != 1) return TD_ERR_IO;
+        }
+        return TD_OK;
+    }
+
+    if (is_serializable_type(type)) {
+        /* Fixed-size vector: write len + raw data */
+        int64_t len = obj->len;
+        if (fwrite(&len, 8, 1, f) != 1) return TD_ERR_IO;
+        uint8_t esz = td_sym_elem_size(type, obj->attrs);
+        size_t data_size = (size_t)len * esz;
+        if (data_size > 0 && fwrite(td_data(obj), 1, data_size, f) != data_size)
+            return TD_ERR_IO;
+        return TD_OK;
+    }
+
+    if (type == TD_LIST) {
+        int64_t count = obj->len;
+        if (fwrite(&count, 8, 1, f) != 1) return TD_ERR_IO;
+        td_t** slots = (td_t**)td_data(obj);
+        for (int64_t i = 0; i < count; i++) {
+            td_err_t err = col_write_recursive(slots[i], f);
+            if (err != TD_OK) return err;
+        }
+        return TD_OK;
+    }
+
+    if (type == TD_TABLE) {
+        int64_t ncols = td_table_ncols(obj);
+        int64_t nrows = td_table_nrows(obj);
+        if (fwrite(&ncols, 8, 1, f) != 1) return TD_ERR_IO;
+        if (fwrite(&nrows, 8, 1, f) != 1) return TD_ERR_IO;
+        for (int64_t c = 0; c < ncols; c++) {
+            int64_t name_sym = td_table_col_name(obj, c);
+            if (fwrite(&name_sym, 8, 1, f) != 1) return TD_ERR_IO;
+            td_t* col = td_table_get_col_idx(obj, c);
+            td_err_t err = col_write_recursive(col, f);
+            if (err != TD_OK) return err;
+        }
+        return TD_OK;
+    }
+
+    return TD_ERR_NYI;
+}
+
+/* Read recursive element from mapped buffer */
+static td_t* col_read_recursive(const uint8_t** pp, size_t* remaining);
+
+static td_t* col_read_recursive(const uint8_t** pp, size_t* remaining) {
+    if (*remaining < 1) return TD_ERR_PTR(TD_ERR_CORRUPT);
+    int8_t type;
+    memcpy(&type, *pp, 1);
+    *pp += 1; *remaining -= 1;
+
+    if (type < 0) {
+        /* Atom */
+        if (type == TD_ATOM_STR) {
+            if (*remaining < 4) return TD_ERR_PTR(TD_ERR_CORRUPT);
+            uint32_t slen;
+            memcpy(&slen, *pp, 4);
+            *pp += 4; *remaining -= 4;
+            if (slen > *remaining) return TD_ERR_PTR(TD_ERR_CORRUPT);
+            td_t* s = td_str((const char*)*pp, (size_t)slen);
+            *pp += slen; *remaining -= slen;
+            return s;
+        } else {
+            /* Fixed atom: 8 bytes */
+            if (*remaining < 8) return TD_ERR_PTR(TD_ERR_CORRUPT);
+            int64_t val;
+            memcpy(&val, *pp, 8);
+            *pp += 8; *remaining -= 8;
+
+            td_t* atom = td_alloc(0);
+            if (!atom || TD_IS_ERR(atom)) return atom;
+            atom->type = type;
+            atom->i64 = val;
+            return atom;
+        }
+    }
+
+    if (is_serializable_type(type)) {
+        /* Fixed-size vector */
+        if (*remaining < 8) return TD_ERR_PTR(TD_ERR_CORRUPT);
+        int64_t len;
+        memcpy(&len, *pp, 8);
+        *pp += 8; *remaining -= 8;
+        if (len < 0) return TD_ERR_PTR(TD_ERR_CORRUPT);
+
+        /* Create a zero-attrs dummy to get elem size */
+        uint8_t esz = td_type_sizes[type];
+        size_t data_size = (size_t)len * esz;
+        if (data_size > *remaining) return TD_ERR_PTR(TD_ERR_CORRUPT);
+
+        td_t* vec = td_vec_new(type, len);
+        if (!vec || TD_IS_ERR(vec)) return vec;
+        vec->len = len;
+        if (data_size > 0)
+            memcpy(td_data(vec), *pp, data_size);
+        *pp += data_size; *remaining -= data_size;
+        return vec;
+    }
+
+    if (type == TD_LIST) {
+        if (*remaining < 8) return TD_ERR_PTR(TD_ERR_CORRUPT);
+        int64_t count;
+        memcpy(&count, *pp, 8);
+        *pp += 8; *remaining -= 8;
+        if (count < 0) return TD_ERR_PTR(TD_ERR_CORRUPT);
+
+        td_t* list = td_list_new(count);
+        if (!list || TD_IS_ERR(list)) return list;
+        for (int64_t i = 0; i < count; i++) {
+            td_t* elem = col_read_recursive(pp, remaining);
+            if (!elem || TD_IS_ERR(elem)) { td_release(list); return elem; }
+            list = td_list_append(list, elem);
+            td_release(elem);
+            if (!list || TD_IS_ERR(list)) return list;
+        }
+        return list;
+    }
+
+    if (type == TD_TABLE) {
+        if (*remaining < 16) return TD_ERR_PTR(TD_ERR_CORRUPT);
+        int64_t ncols, nrows;
+        memcpy(&ncols, *pp, 8);
+        *pp += 8; *remaining -= 8;
+        memcpy(&nrows, *pp, 8);
+        *pp += 8; *remaining -= 8;
+        (void)nrows;  /* nrows is reconstructed from columns */
+
+        if (ncols < 0) return TD_ERR_PTR(TD_ERR_CORRUPT);
+        td_t* tbl = td_table_new(ncols);
+        if (!tbl || TD_IS_ERR(tbl)) return tbl;
+
+        for (int64_t c = 0; c < ncols; c++) {
+            if (*remaining < 8) { td_release(tbl); return TD_ERR_PTR(TD_ERR_CORRUPT); }
+            int64_t name_sym;
+            memcpy(&name_sym, *pp, 8);
+            *pp += 8; *remaining -= 8;
+
+            td_t* col = col_read_recursive(pp, remaining);
+            if (!col || TD_IS_ERR(col)) { td_release(tbl); return col; }
+            tbl = td_table_add_col(tbl, name_sym, col);
+            td_release(col);  /* table_add_col retains */
+            if (!tbl || TD_IS_ERR(tbl)) return tbl;
+        }
+        return tbl;
+    }
+
+    return TD_ERR_PTR(TD_ERR_NYI);
+}
+
+/* --------------------------------------------------------------------------
+ * col_save_list -- serialize a generic TD_LIST
+ * -------------------------------------------------------------------------- */
+
+static td_err_t col_save_list(td_t* list, FILE* f) {
+    uint32_t magic = LIST_MAGIC;
+    if (fwrite(&magic, 4, 1, f) != 1) return TD_ERR_IO;
+    return col_write_recursive(list, f);
+}
+
+/* --------------------------------------------------------------------------
+ * col_save_table -- serialize a TD_TABLE
+ * -------------------------------------------------------------------------- */
+
+static td_err_t col_save_table(td_t* tbl, FILE* f) {
+    uint32_t magic = TABLE_MAGIC;
+    if (fwrite(&magic, 4, 1, f) != 1) return TD_ERR_IO;
+    return col_write_recursive(tbl, f);
+}
+
+/* --------------------------------------------------------------------------
+ * col_load_list -- deserialize a generic TD_LIST from mapped data
+ * -------------------------------------------------------------------------- */
+
+static td_t* col_load_list(const uint8_t* ptr, size_t remaining) {
+    const uint8_t* p = ptr;
+    return col_read_recursive(&p, &remaining);
+}
+
+/* --------------------------------------------------------------------------
+ * col_load_table -- deserialize a TD_TABLE from mapped data
+ * -------------------------------------------------------------------------- */
+
+static td_t* col_load_table(const uint8_t* ptr, size_t remaining) {
+    const uint8_t* p = ptr;
+    return col_read_recursive(&p, &remaining);
+}
+
+/* --------------------------------------------------------------------------
  * td_col_save -- write a vector to a column file
  * -------------------------------------------------------------------------- */
 
 td_err_t td_col_save(td_t* vec, const char* path) {
     if (!vec || TD_IS_ERR(vec)) return TD_ERR_TYPE;
     if (!path) return TD_ERR_IO;
+
+    /* String list: TD_LIST of TD_ATOM_STR atoms */
+    if (is_str_list(vec)) {
+        FILE* f = fopen(path, "wb");
+        if (!f) return TD_ERR_IO;
+        td_err_t err = col_save_str_list(vec, f);
+        fclose(f);
+        return err;
+    }
+
+    /* Generic list */
+    if (vec->type == TD_LIST) {
+        FILE* f = fopen(path, "wb");
+        if (!f) return TD_ERR_IO;
+        td_err_t err = col_save_list(vec, f);
+        fclose(f);
+        return err;
+    }
+
+    /* Table */
+    if (vec->type == TD_TABLE) {
+        FILE* f = fopen(path, "wb");
+        if (!f) return TD_ERR_IO;
+        td_err_t err = col_save_table(vec, f);
+        fclose(f);
+        return err;
+    }
+
     /* Explicit allowlist of serializable types */
     if (!is_serializable_type(vec->type))
         return TD_ERR_NYI;
@@ -139,6 +471,28 @@ td_t* td_col_load(const char* path) {
     size_t mapped_size = 0;
     void* ptr = td_vm_map_file(path, &mapped_size);
     if (!ptr) return TD_ERR_PTR(TD_ERR_IO);
+
+    /* Check for extended format magic numbers (first 4 bytes) */
+    if (mapped_size >= 4) {
+        uint32_t magic;
+        memcpy(&magic, ptr, 4);
+
+        if (magic == STR_LIST_MAGIC) {
+            td_t* result = col_load_str_list((const uint8_t*)ptr + 4, mapped_size - 4);
+            td_vm_unmap_file(ptr, mapped_size);
+            return result;
+        }
+        if (magic == LIST_MAGIC) {
+            td_t* result = col_load_list((const uint8_t*)ptr + 4, mapped_size - 4);
+            td_vm_unmap_file(ptr, mapped_size);
+            return result;
+        }
+        if (magic == TABLE_MAGIC) {
+            td_t* result = col_load_table((const uint8_t*)ptr + 4, mapped_size - 4);
+            td_vm_unmap_file(ptr, mapped_size);
+            return result;
+        }
+    }
 
     if (mapped_size < 32) {
         td_vm_unmap_file(ptr, mapped_size);
