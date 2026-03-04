@@ -1156,18 +1156,20 @@ static td_op_t* split_and_filter(td_graph_t* g, td_op_t* filter_node) {
 
     /* Save IDs before potential realloc */
     uint32_t filter_id = filter_node->id;
+    uint32_t pred_a_id = pred_a->id;
     uint32_t pred_b_id = pred_b->id;
 
-    /* Rewrite: filter_node becomes FILTER(pred_a, input) */
-    filter_node->inputs[1] = pred_a;
-
-    /* Allocate new outer filter */
+    /* Allocate new outer filter first, before mutating existing nodes */
     td_op_t* outer = graph_alloc_node_opt(g);
     if (!outer) return &g->nodes[filter_id];  /* OOM: leave unsplit */
 
     /* Re-fetch after potential realloc */
     filter_node = &g->nodes[filter_id];
+    pred_a = &g->nodes[pred_a_id];
     pred_b = &g->nodes[pred_b_id];
+
+    /* Rewrite: filter_node becomes FILTER(pred_a, input) */
+    filter_node->inputs[1] = pred_a;
 
     outer->opcode = OP_FILTER;
     outer->arity = 2;
