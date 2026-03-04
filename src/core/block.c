@@ -22,6 +22,7 @@
  */
 
 #include "block.h"
+#include "../mem/heap.h"
 
 /* Weak stub for td_alloc — replaced by buddy allocator at link time.
  * Uses td_vm_alloc (mmap) — page-aligned and zero-filled. */
@@ -70,9 +71,6 @@ td_t* td_block_copy(td_t* src) {
     dst->mmod = new_mmod;
     dst->order = new_order;
     atomic_store_explicit(&dst->rc, 1, memory_order_relaxed);
-    /* TODO: td_retain_owned_refs(dst) should be called here to retain
-     * child pointers for STR/LIST/TABLE types. Currently the function is
-     * static in arena.c — callers of td_block_copy must ensure child refs
-     * are retained separately, or use td_alloc_copy() which handles this. */
+    td_retain_owned_refs(dst);
     return dst;
 }

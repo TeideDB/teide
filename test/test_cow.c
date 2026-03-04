@@ -178,6 +178,42 @@ static MunitResult test_cow_vector(const void* params, void* fixture) {
     return MUNIT_OK;
 }
 
+/* ---- block_copy retains children --------------------------------------- */
+
+extern td_t* td_block_copy(td_t* src);
+
+static MunitResult test_block_copy_retains_children(const void* params, void* fixture) {
+    (void)params; (void)fixture;
+
+    td_sym_init();
+
+    int64_t vals[] = {1, 2, 3};
+    td_t* vec = td_vec_from_raw(TD_I64, vals, 3);
+    int64_t name = td_sym_intern("x", 1);
+    td_t* tbl = td_table_new(1);
+    tbl = td_table_add_col(tbl, name, vec);
+    td_release(vec);
+
+    /* Get column ref count before copy */
+    td_t* col_before = td_table_get_col_idx(tbl, 0);
+    uint32_t rc_before = atomic_load(&col_before->rc);
+
+    /* Copy the table block */
+    td_t* copy = td_block_copy(tbl);
+    munit_assert_ptr_not_null(copy);
+    munit_assert_false(TD_IS_ERR(copy));
+
+    /* Column ref count should have increased by 1 */
+    uint32_t rc_after = atomic_load(&col_before->rc);
+    munit_assert_uint(rc_after, ==, rc_before + 1);
+
+    td_release(copy);
+    td_release(tbl);
+    td_sym_destroy();
+
+    return MUNIT_OK;
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 static MunitTest cow_tests[] = {
@@ -186,6 +222,7 @@ static MunitTest cow_tests[] = {
     { "/cow_shared",         test_cow_shared,        cow_setup, cow_teardown, 0, NULL },
     { "/null_error_safety",  test_null_error_safety, cow_setup, cow_teardown, 0, NULL },
     { "/cow_vector",         test_cow_vector,        cow_setup, cow_teardown, 0, NULL },
+    { "/block_copy_retains", test_block_copy_retains_children, cow_setup, cow_teardown, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL },
 };
 

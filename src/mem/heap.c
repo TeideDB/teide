@@ -356,7 +356,7 @@ static void td_release_owned_refs(td_t* v) {
     }
 }
 
-static void td_retain_owned_refs(td_t* v) {
+void td_retain_owned_refs(td_t* v) {
     if (!v || TD_IS_ERR(v)) return;
 
     if (td_is_atom(v)) {

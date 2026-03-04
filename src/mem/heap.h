@@ -243,6 +243,10 @@ static inline void td_scratch_arena_init(td_scratch_arena_t* a) {
     a->end = NULL;
 }
 
+/* Retain all child/owned refs inside a compound block (STR/LIST/TABLE/etc.).
+ * Used by td_block_copy and td_alloc_copy after shallow-copying a block. */
+void td_retain_owned_refs(td_t* v);
+
 void* td_scratch_arena_push(td_scratch_arena_t* a, size_t nbytes);
 void  td_scratch_arena_reset(td_scratch_arena_t* a);
 

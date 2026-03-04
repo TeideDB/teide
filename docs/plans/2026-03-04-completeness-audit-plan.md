@@ -1389,7 +1389,7 @@ git commit -m "test: add test_lftj.c with 3 Leapfrog TrieJoin tests"
 
 ---
 
-## Task 6: Fix td_block_copy() child ref retention
+## Task 6: Fix td_block_copy() child ref retention [x]
 
 **Files:**
 - Modify: `src/core/block.c:62-78`

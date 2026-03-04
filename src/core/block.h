@@ -38,8 +38,7 @@
 size_t td_block_size(td_t* v);
 
 /* Allocate a new block and shallow-copy header + data from src.
- * WARNING: Does NOT retain child refs (STR/LIST/TABLE pointers). Callers
- * must retain children separately, or use td_alloc_copy() which handles this.
+ * Retains child refs (STR/LIST/TABLE pointers) via td_retain_owned_refs.
  * Requires td_alloc (declared in td.h, provided by the buddy allocator). */
 td_t* td_block_copy(td_t* src);
 
