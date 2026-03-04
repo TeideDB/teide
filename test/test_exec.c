@@ -843,6 +843,57 @@ static MunitResult test_exec_stddev(const void* params, void* data) {
     return MUNIT_OK;
 }
 
+/* ---- COUNT_DISTINCT ---- */
+static MunitResult test_exec_count_distinct(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_t* tbl = make_exec_table();
+
+    /* id1 has values {1,1,2,2,3,3,1,2,3,1} → 3 distinct */
+    td_graph_t* g = td_graph_new(tbl);
+    td_op_t* id1 = td_scan(g, "id1");
+    td_op_t* cd = td_count_distinct(g, id1);
+    td_t* result = td_execute(g, cd);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->i64, ==, 3);
+    td_release(result);
+    td_graph_free(g);
+
+    /* v1 has values {10,20,...,100} → 10 distinct */
+    g = td_graph_new(tbl);
+    td_op_t* v1 = td_scan(g, "v1");
+    cd = td_count_distinct(g, v1);
+    result = td_execute(g, cd);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->i64, ==, 10);
+    td_release(result);
+    td_graph_free(g);
+
+    /* Single value repeated → 1 distinct */
+    td_sym_init();
+    int64_t ones[] = {1, 1, 1, 1, 1};
+    td_t* ones_v = td_vec_from_raw(TD_I64, ones, 5);
+    int64_t name = td_sym_intern("x", 1);
+    td_t* tbl2 = td_table_new(1);
+    tbl2 = td_table_add_col(tbl2, name, ones_v);
+    td_release(ones_v);
+
+    g = td_graph_new(tbl2);
+    td_op_t* x = td_scan(g, "x");
+    cd = td_count_distinct(g, x);
+    result = td_execute(g, cd);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->i64, ==, 1);
+    td_release(result);
+    td_graph_free(g);
+
+    td_release(tbl2);
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
 /* ======================================================================
  * Suite
  * ====================================================================== */
@@ -866,6 +917,7 @@ static MunitTest exec_tests[] = {
     { "/window",         test_exec_window,            NULL, NULL, 0, NULL },
     { "/select",         test_exec_select,            NULL, NULL, 0, NULL },
     { "/stddev",         test_exec_stddev,            NULL, NULL, 0, NULL },
+    { "/count_distinct", test_exec_count_distinct,    NULL, NULL, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL }
 };
 

@@ -1557,7 +1557,7 @@ git commit -m "feat: add td_stddev/td_stddev_pop/td_var/td_var_pop API wrappers"
 
 ---
 
-## Task 8: Implement OP_COUNT_DISTINCT executor
+## Task 8: Implement OP_COUNT_DISTINCT executor [x]
 
 **Files:**
 - Modify: `src/ops/exec.c` (add `exec_count_distinct` + case in switch)

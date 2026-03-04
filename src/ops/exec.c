@@ -1655,6 +1655,67 @@ static void reduce_merge(reduce_acc_t* dst, const reduce_acc_t* src, int8_t in_t
      * and the last worker's last is the global last. */
 }
 
+/* Hash-based count distinct for integer/float columns */
+static td_t* exec_count_distinct(td_graph_t* g, td_op_t* op, td_t* input) {
+    (void)g; (void)op;
+    if (!input || TD_IS_ERR(input)) return input;
+
+    int8_t in_type = input->type;
+    int64_t len = input->len;
+
+    if (len == 0) return td_i64(0);
+
+    /* Use a simple open-addressing hash set for int64 values */
+    int64_t cap = len < 16 ? 32 : len * 2;
+    /* Round up to power of 2 */
+    int64_t c = 1;
+    while (c < cap) c <<= 1;
+    cap = c;
+
+    td_t* set_hdr;
+    int64_t* set = (int64_t*)scratch_calloc(&set_hdr,
+                                             (size_t)cap * sizeof(int64_t));
+    td_t* used_hdr;
+    uint8_t* used = (uint8_t*)scratch_calloc(&used_hdr,
+                                              (size_t)cap * sizeof(uint8_t));
+    if (!set || !used) {
+        if (set_hdr) scratch_free(set_hdr);
+        if (used_hdr) scratch_free(used_hdr);
+        return TD_ERR_PTR(TD_ERR_OOM);
+    }
+
+    int64_t count = 0;
+    int64_t mask = cap - 1;
+    void* base = td_data(input);
+
+    for (int64_t i = 0; i < len; i++) {
+        int64_t val;
+        if (in_type == TD_F64) {
+            double fv = ((double*)base)[i];
+            memcpy(&val, &fv, sizeof(int64_t));
+        } else {
+            val = read_col_i64(base, i, in_type, input->attrs);
+        }
+
+        /* Open-addressing linear probe */
+        uint64_t h = (uint64_t)val * 0x9E3779B97F4A7C15ULL;
+        int64_t slot = (int64_t)(h & (uint64_t)mask);
+        while (used[slot]) {
+            if (set[slot] == val) goto next_val;
+            slot = (slot + 1) & mask;
+        }
+        /* New distinct value */
+        set[slot] = val;
+        used[slot] = 1;
+        count++;
+        next_val:;
+    }
+
+    scratch_free(set_hdr);
+    scratch_free(used_hdr);
+    return td_i64(count);
+}
+
 static td_t* exec_reduction(td_graph_t* g, td_op_t* op, td_t* input) {
     (void)g;
     if (!input || TD_IS_ERR(input)) return input;
@@ -10631,6 +10692,14 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             td_t* input = exec_node(g, op->inputs[0]);
             if (!input || TD_IS_ERR(input)) return input;
             td_t* result = exec_reduction(g, op, input);
+            td_release(input);
+            return result;
+        }
+
+        case OP_COUNT_DISTINCT: {
+            td_t* input = exec_node(g, op->inputs[0]);
+            if (!input || TD_IS_ERR(input)) return input;
+            td_t* result = exec_count_distinct(g, op, input);
             td_release(input);
             return result;
         }
