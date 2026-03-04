@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "WebFetch(domain:teidedb.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:rs.teidedb.com)",
+      "WebSearch"
+    ],
+    "deny": [],
+    "ask": []
+  },
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "CLAUDE_CODE_TEAMMATE_MODE": "tmux"
+  }
+}
