@@ -252,8 +252,9 @@ static td_t* col_read_recursive(const uint8_t** pp, size_t* remaining) {
         *pp += 8; *remaining -= 8;
         if (len < 0) return TD_ERR_PTR(TD_ERR_CORRUPT);
 
-        /* Create a zero-attrs dummy to get elem size */
         uint8_t esz = td_type_sizes[type];
+        if (esz > 0 && (uint64_t)len > SIZE_MAX / esz)
+            return TD_ERR_PTR(TD_ERR_CORRUPT);
         size_t data_size = (size_t)len * esz;
         if (data_size > *remaining) return TD_ERR_PTR(TD_ERR_CORRUPT);
 
@@ -334,24 +335,6 @@ static td_err_t col_save_table(td_t* tbl, FILE* f) {
     uint32_t magic = TABLE_MAGIC;
     if (fwrite(&magic, 4, 1, f) != 1) return TD_ERR_IO;
     return col_write_recursive(tbl, f);
-}
-
-/* --------------------------------------------------------------------------
- * col_load_list -- deserialize a generic TD_LIST from mapped data
- * -------------------------------------------------------------------------- */
-
-static td_t* col_load_list(const uint8_t* ptr, size_t remaining) {
-    const uint8_t* p = ptr;
-    return col_read_recursive(&p, &remaining);
-}
-
-/* --------------------------------------------------------------------------
- * col_load_table -- deserialize a TD_TABLE from mapped data
- * -------------------------------------------------------------------------- */
-
-static td_t* col_load_table(const uint8_t* ptr, size_t remaining) {
-    const uint8_t* p = ptr;
-    return col_read_recursive(&p, &remaining);
 }
 
 /* --------------------------------------------------------------------------
@@ -482,13 +465,10 @@ td_t* td_col_load(const char* path) {
             td_vm_unmap_file(ptr, mapped_size);
             return result;
         }
-        if (magic == LIST_MAGIC) {
-            td_t* result = col_load_list((const uint8_t*)ptr + 4, mapped_size - 4);
-            td_vm_unmap_file(ptr, mapped_size);
-            return result;
-        }
-        if (magic == TABLE_MAGIC) {
-            td_t* result = col_load_table((const uint8_t*)ptr + 4, mapped_size - 4);
+        if (magic == LIST_MAGIC || magic == TABLE_MAGIC) {
+            const uint8_t* p = (const uint8_t*)ptr + 4;
+            size_t rem = mapped_size - 4;
+            td_t* result = col_read_recursive(&p, &rem);
             td_vm_unmap_file(ptr, mapped_size);
             return result;
         }
