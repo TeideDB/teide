@@ -1009,7 +1009,8 @@ static int collect_pred_scans(td_graph_t* g, td_op_t* pred,
 }
 
 /* Redirect all consumers of old_id to point to new_target instead.
- * Skips nodes with IDs skip_a and skip_b (the swapped pair). */
+ * Skips nodes with IDs skip_a and skip_b (the swapped pair).
+ * Updates both g->nodes[] and g->ext_nodes[].base.inputs[]. */
 static void redirect_consumers(td_graph_t* g, uint32_t old_id,
                                td_op_t* new_target,
                                uint32_t skip_a, uint32_t skip_b) {
@@ -1022,10 +1023,21 @@ static void redirect_consumers(td_graph_t* g, uint32_t old_id,
                 c->inputs[k] = new_target;
         }
     }
+    /* Also update ext_node heap copies to keep them in sync */
+    for (uint32_t j = 0; j < g->ext_count; j++) {
+        if (!g->ext_nodes[j]) continue;
+        td_op_t* c = &g->ext_nodes[j]->base;
+        if (c->flags & OP_FLAG_DEAD) continue;
+        if (c->id == skip_a || c->id == skip_b) continue;
+        for (int k = 0; k < c->arity && k < 2; k++) {
+            if (c->inputs[k] && c->inputs[k]->id == old_id)
+                c->inputs[k] = new_target;
+        }
+    }
 }
 
-static void pass_predicate_pushdown(td_graph_t* g, td_op_t* root) {
-    if (!g || !root) return;
+static td_op_t* pass_predicate_pushdown(td_graph_t* g, td_op_t* root) {
+    if (!g || !root) return root;
 
     /* Multiple iterations: pushdown may enable further pushdowns */
     for (int iter = 0; iter < 4; iter++) {
@@ -1049,6 +1061,7 @@ static void pass_predicate_pushdown(td_graph_t* g, td_op_t* root) {
                 n->inputs[0] = proj_input;
                 child->inputs[0] = n;
                 redirect_consumers(g, n->id, child, child->id, n->id);
+                if (n->id == root->id) root = child;
                 changed = true;
                 continue;
             }
@@ -1080,12 +1093,14 @@ static void pass_predicate_pushdown(td_graph_t* g, td_op_t* root) {
                 n->inputs[0] = expand_src;
                 child->inputs[0] = n;
                 redirect_consumers(g, n->id, child, child->id, n->id);
+                if (n->id == root->id) root = child;
                 changed = true;
                 continue;
             }
         }
         if (!changed) break;
     }
+    return root;
 }
 
 /* Score a predicate subtree: lower = cheaper = execute first. */
@@ -1175,9 +1190,10 @@ static int collect_filter_chain(td_op_t* top, td_op_t** chain, int max) {
     return n;
 }
 
-static void pass_filter_reorder(td_graph_t* g, td_op_t* root) {
-    if (!g || !root) return;
+static td_op_t* pass_filter_reorder(td_graph_t* g, td_op_t* root) {
+    if (!g || !root) return root;
 
+    uint32_t root_id = root->id;
     uint32_t nc = g->node_count;
 
     /* First pass: split AND predicates in filters */
@@ -1194,18 +1210,8 @@ static void pass_filter_reorder(td_graph_t* g, td_op_t* root) {
         td_op_t* new_outer = split_and_filter(g, n);
         n = &g->nodes[orig_id];  /* re-fetch after potential realloc */
         if (new_outer->id != orig_id) {
-            /* Update all consumers of old node to point to new outer */
-            uint32_t new_nc = g->node_count;
-            for (uint32_t j = 0; j < new_nc; j++) {
-                td_op_t* c = &g->nodes[j];
-                if (c->flags & OP_FLAG_DEAD) continue;
-                for (int k = 0; k < c->arity && k < 2; k++) {
-                    if (c->inputs[k] && c->inputs[k]->id == orig_id &&
-                        c->id != new_outer->id) {
-                        c->inputs[k] = new_outer;
-                    }
-                }
-            }
+            redirect_consumers(g, orig_id, new_outer, new_outer->id, orig_id);
+            if (orig_id == root_id) root_id = new_outer->id;
         }
     }
 
@@ -1218,7 +1224,7 @@ static void pass_filter_reorder(td_graph_t* g, td_op_t* root) {
         visited = visited_stack;
     } else {
         visited = (bool*)td_sys_alloc(nc * sizeof(bool));
-        if (!visited) return;
+        if (!visited) return &g->nodes[root_id];
     }
     memset(visited, 0, nc * sizeof(bool));
 
@@ -1263,6 +1269,7 @@ static void pass_filter_reorder(td_graph_t* g, td_op_t* root) {
     }
 
     if (nc > 256) td_sys_free(visited);
+    return &g->nodes[root_id];
 }
 
 /* --------------------------------------------------------------------------
@@ -1284,11 +1291,11 @@ td_op_t* td_optimize(td_graph_t* g, td_op_t* root) {
     /* Pass 4: Factorized detection (OP_EXPAND → OP_GROUP optimization) */
     factorize_pass(g, root);
 
-    /* Pass 5: Predicate pushdown */
-    pass_predicate_pushdown(g, root);
+    /* Pass 5: Predicate pushdown (may change root) */
+    root = pass_predicate_pushdown(g, root);
 
-    /* Pass 6: Filter reordering (split ANDs + reorder by cost) */
-    pass_filter_reorder(g, root);
+    /* Pass 6: Filter reordering (split ANDs + reorder by cost, may change root) */
+    root = pass_filter_reorder(g, root);
 
     /* Pass 7: Fusion */
     td_fuse_pass(g, root);
@@ -1296,7 +1303,5 @@ td_op_t* td_optimize(td_graph_t* g, td_op_t* root) {
     /* Pass 8: DCE */
     pass_dce(g, root);
 
-    /* Return root — may have been replaced during folding.
-       Use g->nodes[root_id] pattern for safety. */
-    return &g->nodes[root->id];
+    return root;
 }

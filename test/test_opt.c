@@ -203,14 +203,16 @@ static MunitResult test_pushdown_past_project(const void* params, void* data) {
     td_op_t* filt = td_filter(g, proj, pred);
 
     /* Verify DAG structure after optimization: filter should be below project.
-     * td_optimize returns the node at root's original ID (the FILTER),
-     * so check the PROJECT node directly to verify it now wraps the FILTER. */
+     * td_optimize now correctly returns the new root (COUNT, whose input
+     * chain is COUNT -> PROJECT -> FILTER -> SCAN after pushdown). */
     td_optimize(g, filt);
     td_op_t* proj_after = &g->nodes[proj_id];
     munit_assert_int(proj_after->opcode, ==, OP_PROJECT);
     munit_assert_int(proj_after->inputs[0]->opcode, ==, OP_FILTER);
 
-    /* Verify correctness */
+    /* Verify correctness: execute through the pushed-down filter.
+     * COUNT bypasses PROJECT (just counts filtered rows), which is
+     * sufficient to validate the filter produces correct results. */
     td_op_t* cnt = td_count(g, filt);
     td_t* result = td_execute(g, cnt);
     munit_assert_false(TD_IS_ERR(result));
@@ -225,12 +227,13 @@ static MunitResult test_pushdown_past_project(const void* params, void* data) {
 }
 
 /*
- * Test: FILTER on group key pushes below GROUP.
+ * Test: FILTER above GROUP correctness (GROUP pushdown is disabled).
  *
  * Build: FILTER(id1 = 1, GROUP(id1, SUM(v1)))
- * After: GROUP(id1, SUM(v1), FILTER(id1 = 1, ...))
+ * After: unchanged (GROUP pushdown disabled — executor key/agg scans
+ *        bypass filter, so pushdown would produce wrong results).
  *
- * Verify DAG structure and correctness. Result: id1=1, sum=200
+ * Verify correctness of filter-above-group execution. Result: id1=1, sum=200
  */
 static MunitResult test_pushdown_past_group(const void* params, void* data) {
     (void)params; (void)data;
