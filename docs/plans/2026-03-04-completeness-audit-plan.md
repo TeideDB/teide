@@ -1007,7 +1007,7 @@ git commit -m "test: add test_csv.c with 4 CSV I/O tests"
 
 ---
 
-## Task 3: Add test_sel.c — selection vector tests
+## Task 3: Add test_sel.c — selection vector tests [x]
 
 **Files:**
 - Create: `test/test_sel.c`
