@@ -855,7 +855,7 @@ git commit -m "test: add test_exec.c with 17 tests for executor opcodes"
 
 ---
 
-## Task 2: Add test_csv.c — CSV I/O tests
+## Task 2: Add test_csv.c — CSV I/O tests [x]
 
 **Files:**
 - Create: `test/test_csv.c`
