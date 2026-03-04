@@ -1322,30 +1322,37 @@ static td_op_t* pass_filter_reorder(td_graph_t* g, td_op_t* root) {
     if (!g || !root) return root;
 
     uint32_t root_id = root->id;
-    uint32_t nc = g->node_count;
 
-    /* First pass: split AND predicates in filters */
-    for (uint32_t i = 0; i < nc; i++) {
-        td_op_t* n = &g->nodes[i];
-        if (n->flags & OP_FLAG_DEAD) continue;
-        if (n->opcode != OP_FILTER) continue;
-        if (n->arity != 2 || !n->inputs[1]) continue;
-        if (n->inputs[1]->opcode != OP_AND) continue;
+    /* First pass: split AND predicates in filters.
+     * Iterate until no more splits occur so nested ANDs like
+     * AND(AND(a,b), c) are fully decomposed into individual filters. */
+    for (int split_iter = 0; split_iter < 16; split_iter++) {
+        bool split_changed = false;
+        uint32_t nc = g->node_count;
+        for (uint32_t i = 0; i < nc; i++) {
+            td_op_t* n = &g->nodes[i];
+            if (n->flags & OP_FLAG_DEAD) continue;
+            if (n->opcode != OP_FILTER) continue;
+            if (n->arity != 2 || !n->inputs[1]) continue;
+            if (n->inputs[1]->opcode != OP_AND) continue;
 
-        /* Split AND and update consumers to point to new outer.
-         * split_and_filter may realloc g->nodes, so re-fetch n afterwards. */
-        uint32_t orig_id = i;
-        td_op_t* new_outer = split_and_filter(g, n);
-        n = &g->nodes[orig_id];  /* re-fetch after potential realloc */
-        if (new_outer->id != orig_id) {
-            redirect_consumers(g, orig_id, new_outer, new_outer->id, orig_id);
-            if (orig_id == root_id) root_id = new_outer->id;
+            /* Split AND and update consumers to point to new outer.
+             * split_and_filter may realloc g->nodes, so re-fetch n afterwards. */
+            uint32_t orig_id = i;
+            td_op_t* new_outer = split_and_filter(g, n);
+            n = &g->nodes[orig_id];  /* re-fetch after potential realloc */
+            if (new_outer->id != orig_id) {
+                redirect_consumers(g, orig_id, new_outer, new_outer->id, orig_id);
+                if (orig_id == root_id) root_id = new_outer->id;
+                split_changed = true;
+            }
         }
+        if (!split_changed) break;
     }
 
     /* Second pass: reorder filter chains by cost.
      * Use insertion sort on chain arrays (chains are typically short). */
-    nc = g->node_count;  /* may have grown from splits */
+    uint32_t nc = g->node_count;  /* may have grown from splits */
     bool* visited = NULL;
     bool visited_stack[256];
     if (nc <= 256) {
