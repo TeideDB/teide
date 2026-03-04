@@ -64,11 +64,11 @@ static void graph_fixup_ext_ptrs(td_graph_t* g, ptrdiff_t delta) {
                 }
                 break;
             case OP_WINDOW_JOIN:
-                ext->wjoin.time_key = &g->nodes[ext->wjoin.time_key->id];
+                ext->wjoin.time_key = graph_fix_ptr(ext->wjoin.time_key, delta);
                 if (ext->wjoin.sym_key)
-                    ext->wjoin.sym_key = &g->nodes[ext->wjoin.sym_key->id];
+                    ext->wjoin.sym_key = graph_fix_ptr(ext->wjoin.sym_key, delta);
                 for (uint8_t k = 0; k < ext->wjoin.n_aggs; k++)
-                    ext->wjoin.agg_inputs[k] = &g->nodes[ext->wjoin.agg_inputs[k]->id];
+                    ext->wjoin.agg_inputs[k] = graph_fix_ptr(ext->wjoin.agg_inputs[k], delta);
                 break;
             case OP_WINDOW:
                 for (uint8_t k = 0; k < ext->window.n_part_keys; k++)

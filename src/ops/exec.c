@@ -8078,13 +8078,14 @@ static td_t* exec_window_join(td_graph_t* g, td_op_t* op,
     int64_t* rt_sym_data = NULL;
     if (ext->wjoin.sym_key) {
         td_op_ext_t* sym_ext = find_ext(g, ext->wjoin.sym_key->id);
-        if (sym_ext && sym_ext->base.opcode == OP_SCAN) {
-            int64_t sym_sym = sym_ext->sym;
-            td_t* lt_sym_vec = td_table_get_col(left_table, sym_sym);
-            td_t* rt_sym_vec = td_table_get_col(right_table, sym_sym);
-            if (lt_sym_vec) lt_sym_data = (int64_t*)td_data(lt_sym_vec);
-            if (rt_sym_vec) rt_sym_data = (int64_t*)td_data(rt_sym_vec);
-        }
+        if (!sym_ext || sym_ext->base.opcode != OP_SCAN)
+            return TD_ERR_PTR(TD_ERR_NYI);
+        int64_t sym_sym = sym_ext->sym;
+        td_t* lt_sym_vec = td_table_get_col(left_table, sym_sym);
+        td_t* rt_sym_vec = td_table_get_col(right_table, sym_sym);
+        if (!lt_sym_vec || !rt_sym_vec) return TD_ERR_PTR(TD_ERR_SCHEMA);
+        lt_sym_data = (int64_t*)td_data(lt_sym_vec);
+        rt_sym_data = (int64_t*)td_data(rt_sym_vec);
     }
 
     /* Build match index: for each left row, find best matching right row */
