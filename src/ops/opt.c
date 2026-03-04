@@ -124,13 +124,22 @@ static void pass_type_inference(td_graph_t* g, td_op_t* root) {
                             stack[sp++] = ext->sort.columns[k]->id;
                     break;
                 case OP_JOIN:
-                case OP_WINDOW_JOIN:
                     for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
                         if (ext->join.left_keys[k] && !visited[ext->join.left_keys[k]->id] && sp < (int)nc)
                             stack[sp++] = ext->join.left_keys[k]->id;
                         if (ext->join.right_keys && ext->join.right_keys[k] &&
                             !visited[ext->join.right_keys[k]->id] && sp < (int)nc)
                             stack[sp++] = ext->join.right_keys[k]->id;
+                    }
+                    break;
+                case OP_WINDOW_JOIN:
+                    if (ext->wjoin.time_key && !visited[ext->wjoin.time_key->id] && sp < (int)nc)
+                        stack[sp++] = ext->wjoin.time_key->id;
+                    if (ext->wjoin.sym_key && !visited[ext->wjoin.sym_key->id] && sp < (int)nc)
+                        stack[sp++] = ext->wjoin.sym_key->id;
+                    for (uint8_t k = 0; k < ext->wjoin.n_aggs; k++) {
+                        if (ext->wjoin.agg_inputs[k] && !visited[ext->wjoin.agg_inputs[k]->id] && sp < (int)nc)
+                            stack[sp++] = ext->wjoin.agg_inputs[k]->id;
                     }
                     break;
                 case OP_WINDOW:
@@ -551,13 +560,22 @@ static void pass_constant_fold(td_graph_t* g, td_op_t* root) {
                             stack[sp++] = ext->sort.columns[k]->id;
                     break;
                 case OP_JOIN:
-                case OP_WINDOW_JOIN:
                     for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
                         if (ext->join.left_keys[k] && !visited[ext->join.left_keys[k]->id] && sp < (int)nc)
                             stack[sp++] = ext->join.left_keys[k]->id;
                         if (ext->join.right_keys && ext->join.right_keys[k] &&
                             !visited[ext->join.right_keys[k]->id] && sp < (int)nc)
                             stack[sp++] = ext->join.right_keys[k]->id;
+                    }
+                    break;
+                case OP_WINDOW_JOIN:
+                    if (ext->wjoin.time_key && !visited[ext->wjoin.time_key->id] && sp < (int)nc)
+                        stack[sp++] = ext->wjoin.time_key->id;
+                    if (ext->wjoin.sym_key && !visited[ext->wjoin.sym_key->id] && sp < (int)nc)
+                        stack[sp++] = ext->wjoin.sym_key->id;
+                    for (uint8_t k = 0; k < ext->wjoin.n_aggs; k++) {
+                        if (ext->wjoin.agg_inputs[k] && !visited[ext->wjoin.agg_inputs[k]->id] && sp < (int)nc)
+                            stack[sp++] = ext->wjoin.agg_inputs[k]->id;
                     }
                     break;
                 case OP_WINDOW:
@@ -686,13 +704,22 @@ static void mark_live(td_graph_t* g, td_op_t* root, bool* live) {
                         }
                         break;
                     case OP_JOIN:
-                    case OP_WINDOW_JOIN:
                         for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
                             if (ext->join.left_keys[k] && !live[ext->join.left_keys[k]->id] && sp < (int)stack_cap)
                                 stack[sp++] = ext->join.left_keys[k]->id;
                             if (ext->join.right_keys && ext->join.right_keys[k] &&
                                 !live[ext->join.right_keys[k]->id] && sp < (int)stack_cap)
                                 stack[sp++] = ext->join.right_keys[k]->id;
+                        }
+                        break;
+                    case OP_WINDOW_JOIN:
+                        if (ext->wjoin.time_key && !live[ext->wjoin.time_key->id] && sp < (int)stack_cap)
+                            stack[sp++] = ext->wjoin.time_key->id;
+                        if (ext->wjoin.sym_key && !live[ext->wjoin.sym_key->id] && sp < (int)stack_cap)
+                            stack[sp++] = ext->wjoin.sym_key->id;
+                        for (uint8_t k = 0; k < ext->wjoin.n_aggs; k++) {
+                            if (ext->wjoin.agg_inputs[k] && !live[ext->wjoin.agg_inputs[k]->id] && sp < (int)stack_cap)
+                                stack[sp++] = ext->wjoin.agg_inputs[k]->id;
                         }
                         break;
                     case OP_WINDOW:
@@ -922,7 +949,6 @@ static td_op_t* graph_alloc_node_opt(td_graph_t* g) {
                                         (td_op_t*)((char*)g->ext_nodes[i]->sort.columns[k] + delta);
                             break;
                         case OP_JOIN:
-                        case OP_WINDOW_JOIN:
                             for (uint8_t k = 0; k < g->ext_nodes[i]->join.n_join_keys; k++) {
                                 if (g->ext_nodes[i]->join.left_keys[k])
                                     g->ext_nodes[i]->join.left_keys[k] =
@@ -931,6 +957,19 @@ static td_op_t* graph_alloc_node_opt(td_graph_t* g) {
                                     g->ext_nodes[i]->join.right_keys[k])
                                     g->ext_nodes[i]->join.right_keys[k] =
                                         (td_op_t*)((char*)g->ext_nodes[i]->join.right_keys[k] + delta);
+                            }
+                            break;
+                        case OP_WINDOW_JOIN:
+                            if (g->ext_nodes[i]->wjoin.time_key)
+                                g->ext_nodes[i]->wjoin.time_key =
+                                    (td_op_t*)((char*)g->ext_nodes[i]->wjoin.time_key + delta);
+                            if (g->ext_nodes[i]->wjoin.sym_key)
+                                g->ext_nodes[i]->wjoin.sym_key =
+                                    (td_op_t*)((char*)g->ext_nodes[i]->wjoin.sym_key + delta);
+                            for (uint8_t k = 0; k < g->ext_nodes[i]->wjoin.n_aggs; k++) {
+                                if (g->ext_nodes[i]->wjoin.agg_inputs[k])
+                                    g->ext_nodes[i]->wjoin.agg_inputs[k] =
+                                        (td_op_t*)((char*)g->ext_nodes[i]->wjoin.agg_inputs[k] + delta);
                             }
                             break;
                         case OP_WINDOW:

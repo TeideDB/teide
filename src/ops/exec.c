@@ -8044,6 +8044,123 @@ join_cleanup:
 }
 
 /* ============================================================================
+ * OP_WINDOW_JOIN: ASOF window join
+ * For each left row, find the best matching right row within [time+lo, time+hi]
+ * optionally partitioned by sym key, then gather aggregation columns.
+ * ============================================================================ */
+
+static td_t* exec_window_join(td_graph_t* g, td_op_t* op,
+                               td_t* left_table, td_t* right_table) {
+    td_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
+
+    int64_t  window_lo = ext->wjoin.window_lo;
+    int64_t  window_hi = ext->wjoin.window_hi;
+    uint8_t  n_aggs    = ext->wjoin.n_aggs;
+
+    int64_t left_n  = td_table_nrows(left_table);
+    int64_t right_n = td_table_nrows(right_table);
+
+    /* Resolve time key column from both tables */
+    td_op_ext_t* time_ext = find_ext(g, ext->wjoin.time_key->id);
+    if (!time_ext || time_ext->base.opcode != OP_SCAN)
+        return TD_ERR_PTR(TD_ERR_NYI);
+    int64_t time_sym = time_ext->sym;
+    td_t* lt_time = td_table_get_col(left_table, time_sym);
+    td_t* rt_time = td_table_get_col(right_table, time_sym);
+    if (!lt_time || !rt_time) return TD_ERR_PTR(TD_ERR_SCHEMA);
+
+    int64_t* lt_data = (int64_t*)td_data(lt_time);
+    int64_t* rt_data = (int64_t*)td_data(rt_time);
+
+    /* Resolve optional sym key */
+    int64_t* lt_sym_data = NULL;
+    int64_t* rt_sym_data = NULL;
+    if (ext->wjoin.sym_key) {
+        td_op_ext_t* sym_ext = find_ext(g, ext->wjoin.sym_key->id);
+        if (sym_ext && sym_ext->base.opcode == OP_SCAN) {
+            int64_t sym_sym = sym_ext->sym;
+            td_t* lt_sym_vec = td_table_get_col(left_table, sym_sym);
+            td_t* rt_sym_vec = td_table_get_col(right_table, sym_sym);
+            if (lt_sym_vec) lt_sym_data = (int64_t*)td_data(lt_sym_vec);
+            if (rt_sym_vec) rt_sym_data = (int64_t*)td_data(rt_sym_vec);
+        }
+    }
+
+    /* Build match index: for each left row, find best matching right row */
+    td_t* match_hdr = NULL;
+    int64_t* match_idx = (int64_t*)scratch_alloc(&match_hdr,
+                              (size_t)left_n * sizeof(int64_t));
+    if (!match_idx) return TD_ERR_PTR(TD_ERR_OOM);
+
+    for (int64_t i = 0; i < left_n; i++) {
+        int64_t lt_t = lt_data[i];
+        int64_t lo = lt_t + window_lo;
+        int64_t hi = lt_t + window_hi;
+        int64_t best = -1;
+        int64_t best_time = INT64_MIN;
+
+        for (int64_t j = 0; j < right_n; j++) {
+            int64_t rt_t = rt_data[j];
+            if (rt_t < lo || rt_t > hi) continue;
+            if (lt_sym_data && rt_sym_data && lt_sym_data[i] != rt_sym_data[j])
+                continue;
+            if (rt_t > best_time) {
+                best_time = rt_t;
+                best = j;
+            }
+        }
+        match_idx[i] = best;
+    }
+
+    /* Build output table: all left columns + agg columns from right */
+    int64_t left_ncols = td_table_ncols(left_table);
+    td_t* out = td_table_new(left_ncols + n_aggs);
+
+    /* Copy left columns */
+    for (int64_t c = 0; c < left_ncols; c++) {
+        int64_t col_name = td_table_col_name(left_table, c);
+        td_t* col = td_table_get_col_idx(left_table, c);
+        td_retain(col);
+        out = td_table_add_col(out, col_name, col);
+        td_release(col);
+    }
+
+    /* Build aggregated right columns using match index */
+    for (uint8_t a = 0; a < n_aggs; a++) {
+        td_op_ext_t* agg_ext = find_ext(g, ext->wjoin.agg_inputs[a]->id);
+        if (!agg_ext || agg_ext->base.opcode != OP_SCAN) {
+            scratch_free(match_hdr); td_release(out);
+            return TD_ERR_PTR(TD_ERR_NYI);
+        }
+        int64_t  agg_sym   = agg_ext->sym;
+        td_t* rcol = td_table_get_col(right_table, agg_sym);
+        if (!rcol) { scratch_free(match_hdr); td_release(out); return TD_ERR_PTR(TD_ERR_SCHEMA); }
+
+        int8_t rtype = rcol->type;
+        td_t* out_col = td_vec_new(rtype, left_n);
+
+        if (rtype == TD_F64) {
+            double* src = (double*)td_data(rcol);
+            double* dst = (double*)td_data(out_col);
+            for (int64_t i = 0; i < left_n; i++)
+                dst[i] = (match_idx[i] >= 0) ? src[match_idx[i]] : 0.0;
+        } else {
+            int64_t* src = (int64_t*)td_data(rcol);
+            int64_t* dst = (int64_t*)td_data(out_col);
+            for (int64_t i = 0; i < left_n; i++)
+                dst[i] = (match_idx[i] >= 0) ? src[match_idx[i]] : 0;
+        }
+        out_col->len = left_n;
+        out = td_table_add_col(out, agg_sym, out_col);
+        td_release(out_col);
+    }
+
+    scratch_free(match_hdr);
+    return out;
+}
+
+/* ============================================================================
  * OP_IF: ternary select  result[i] = cond[i] ? then[i] : else[i]
  * ============================================================================ */
 
@@ -10899,6 +11016,24 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                 left = compacted;
             }
             td_t* result = exec_join(g, op, left, right);
+            td_release(left);
+            td_release(right);
+            return result;
+        }
+
+        case OP_WINDOW_JOIN: {
+            td_t* left = exec_node(g, op->inputs[0]);
+            td_t* right = exec_node(g, op->inputs[1]);
+            if (!left || TD_IS_ERR(left)) { if (right && !TD_IS_ERR(right)) td_release(right); return left; }
+            if (!right || TD_IS_ERR(right)) { td_release(left); return right; }
+            if (g->selection && left && !TD_IS_ERR(left) && left->type == TD_TABLE) {
+                td_t* compacted = sel_compact(g, left, g->selection);
+                td_release(left);
+                td_release(g->selection);
+                g->selection = NULL;
+                left = compacted;
+            }
+            td_t* result = exec_window_join(g, op, left, right);
             td_release(left);
             td_release(right);
             return result;

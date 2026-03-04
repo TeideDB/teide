@@ -957,6 +957,227 @@ static MunitResult test_exec_count_distinct(const void* params, void* data) {
     return MUNIT_OK;
 }
 
+/* ---- WINDOW JOIN (ASOF) ---- */
+static MunitResult test_exec_window_join(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    /* Left table: time(I64), sym(I64), price(F64) — trade events */
+    int64_t ltime[]  = {100, 200, 300, 400, 500};
+    int64_t lsym[]   = {1, 1, 2, 1, 2};
+    double  lprice[] = {10.0, 20.0, 30.0, 40.0, 50.0};
+
+    td_t* lt_v = td_vec_from_raw(TD_I64, ltime, 5);
+    td_t* ls_v = td_vec_from_raw(TD_I64, lsym, 5);
+    td_t* lp_v = td_vec_from_raw(TD_F64, lprice, 5);
+
+    int64_t n_time  = td_sym_intern("time", 4);
+    int64_t n_sym   = td_sym_intern("sym", 3);
+    int64_t n_price = td_sym_intern("price", 5);
+
+    td_t* left = td_table_new(3);
+    left = td_table_add_col(left, n_time, lt_v);
+    left = td_table_add_col(left, n_sym, ls_v);
+    left = td_table_add_col(left, n_price, lp_v);
+    td_release(lt_v); td_release(ls_v); td_release(lp_v);
+
+    /* Right table: time(I64), sym(I64), bid(F64) — quote snapshots */
+    int64_t rtime[] = {90, 150, 250, 350, 450};
+    int64_t rsym[]  = {1, 1, 2, 1, 2};
+    double  rbid[]  = {9.5, 15.0, 25.0, 35.0, 45.0};
+
+    td_t* rt_v = td_vec_from_raw(TD_I64, rtime, 5);
+    td_t* rs_v = td_vec_from_raw(TD_I64, rsym, 5);
+    td_t* rb_v = td_vec_from_raw(TD_F64, rbid, 5);
+
+    int64_t n_bid = td_sym_intern("bid", 3);
+
+    td_t* right = td_table_new(3);
+    right = td_table_add_col(right, n_time, rt_v);
+    right = td_table_add_col(right, n_sym, rs_v);
+    right = td_table_add_col(right, n_bid, rb_v);
+    td_release(rt_v); td_release(rs_v); td_release(rb_v);
+
+    td_graph_t* g = td_graph_new(left);
+    td_op_t* left_op  = td_const_table(g, left);
+    td_op_t* right_op = td_const_table(g, right);
+    td_op_t* tkey = td_scan(g, "time");
+    td_op_t* skey = td_scan(g, "sym");
+
+    /* ASOF join: for each trade, find the most recent quote within window [-200, 0] */
+    uint16_t agg_ops[] = { OP_LAST };
+    td_op_t* bid_scan = td_scan(g, "bid");
+    td_op_t* agg_ins[] = { bid_scan };
+
+    td_op_t* wj = td_window_join(g, left_op, right_op,
+                                  tkey, skey,
+                                  -200, 0,
+                                  agg_ops, agg_ins, 1);
+
+    td_t* result = td_execute(g, wj);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->type, ==, TD_TABLE);
+    munit_assert_int(td_table_nrows(result), ==, 5);
+
+    /* Should have left cols (time, sym, price) + agg col (bid) = 4 */
+    munit_assert_int(td_table_ncols(result), ==, 4);
+
+    /* Verify the bid column was joined correctly */
+    td_t* bid_col = td_table_get_col(result, n_bid);
+    munit_assert_ptr_not_null(bid_col);
+    double* bid_data = (double*)td_data(bid_col);
+    /* Left time=100, sym=1: right candidates sym=1 in [-100,100]: t=90 -> bid=9.5 */
+    munit_assert_double(bid_data[0], ==, 9.5);
+    /* Left time=200, sym=1: right candidates sym=1 in [0,200]: t=90,150 -> best=150 -> bid=15.0 */
+    munit_assert_double(bid_data[1], ==, 15.0);
+    /* Left time=300, sym=2: right candidates sym=2 in [100,300]: t=250 -> bid=25.0 */
+    munit_assert_double(bid_data[2], ==, 25.0);
+    /* Left time=400, sym=1: right candidates sym=1 in [200,400]: t=350 -> bid=35.0 */
+    munit_assert_double(bid_data[3], ==, 35.0);
+    /* Left time=500, sym=2: right candidates sym=2 in [300,500]: t=450 -> bid=45.0 */
+    munit_assert_double(bid_data[4], ==, 45.0);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(left);
+    td_release(right);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* ---- WINDOW JOIN without sym key (no partition) ---- */
+static MunitResult test_exec_window_join_no_sym(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    /* Left: time, val */
+    int64_t ltime[] = {100, 200, 300};
+    int64_t lval[]  = {10, 20, 30};
+    td_t* lt_v = td_vec_from_raw(TD_I64, ltime, 3);
+    td_t* lv_v = td_vec_from_raw(TD_I64, lval, 3);
+    int64_t n_time = td_sym_intern("time", 4);
+    int64_t n_val  = td_sym_intern("val", 3);
+    td_t* left = td_table_new(2);
+    left = td_table_add_col(left, n_time, lt_v);
+    left = td_table_add_col(left, n_val, lv_v);
+    td_release(lt_v); td_release(lv_v);
+
+    /* Right: time, score */
+    int64_t rtime[]  = {50, 150, 250};
+    int64_t rscore[] = {1, 2, 3};
+    td_t* rt_v = td_vec_from_raw(TD_I64, rtime, 3);
+    td_t* rs_v = td_vec_from_raw(TD_I64, rscore, 3);
+    int64_t n_score = td_sym_intern("score", 5);
+    td_t* right = td_table_new(2);
+    right = td_table_add_col(right, n_time, rt_v);
+    right = td_table_add_col(right, n_score, rs_v);
+    td_release(rt_v); td_release(rs_v);
+
+    td_graph_t* g = td_graph_new(left);
+    td_op_t* left_op  = td_const_table(g, left);
+    td_op_t* right_op = td_const_table(g, right);
+    td_op_t* tkey = td_scan(g, "time");
+
+    uint16_t agg_ops[] = { OP_LAST };
+    td_op_t* score_scan = td_scan(g, "score");
+    td_op_t* agg_ins[] = { score_scan };
+
+    /* No sym key (NULL) — no partition, window [-100, 0] */
+    td_op_t* wj = td_window_join(g, left_op, right_op,
+                                  tkey, NULL,
+                                  -100, 0,
+                                  agg_ops, agg_ins, 1);
+
+    td_t* result = td_execute(g, wj);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->type, ==, TD_TABLE);
+    munit_assert_int(td_table_nrows(result), ==, 3);
+    munit_assert_int(td_table_ncols(result), ==, 3); /* time, val, score */
+
+    td_t* score_col = td_table_get_col(result, n_score);
+    munit_assert_ptr_not_null(score_col);
+    int64_t* score_data = (int64_t*)td_data(score_col);
+    /* Left t=100: right in [0,100]: t=50 -> score=1 */
+    munit_assert_int(score_data[0], ==, 1);
+    /* Left t=200: right in [100,200]: t=150 -> score=2 */
+    munit_assert_int(score_data[1], ==, 2);
+    /* Left t=300: right in [200,300]: t=250 -> score=3 */
+    munit_assert_int(score_data[2], ==, 3);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(left);
+    td_release(right);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* ---- WINDOW JOIN with empty right table ---- */
+static MunitResult test_exec_window_join_empty(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    /* Left: time, val */
+    int64_t ltime[] = {100, 200};
+    int64_t lval[]  = {10, 20};
+    td_t* lt_v = td_vec_from_raw(TD_I64, ltime, 2);
+    td_t* lv_v = td_vec_from_raw(TD_I64, lval, 2);
+    int64_t n_time = td_sym_intern("time", 4);
+    int64_t n_val  = td_sym_intern("val", 3);
+    td_t* left = td_table_new(2);
+    left = td_table_add_col(left, n_time, lt_v);
+    left = td_table_add_col(left, n_val, lv_v);
+    td_release(lt_v); td_release(lv_v);
+
+    /* Right: time, score — empty */
+    int64_t n_score = td_sym_intern("score", 5);
+    td_t* rt_v = td_vec_new(TD_I64, 0);
+    td_t* rs_v = td_vec_new(TD_I64, 0);
+    td_t* right = td_table_new(2);
+    right = td_table_add_col(right, n_time, rt_v);
+    right = td_table_add_col(right, n_score, rs_v);
+    td_release(rt_v); td_release(rs_v);
+
+    td_graph_t* g = td_graph_new(left);
+    td_op_t* left_op  = td_const_table(g, left);
+    td_op_t* right_op = td_const_table(g, right);
+    td_op_t* tkey = td_scan(g, "time");
+
+    uint16_t agg_ops[] = { OP_LAST };
+    td_op_t* score_scan = td_scan(g, "score");
+    td_op_t* agg_ins[] = { score_scan };
+
+    td_op_t* wj = td_window_join(g, left_op, right_op,
+                                  tkey, NULL,
+                                  -100, 0,
+                                  agg_ops, agg_ins, 1);
+
+    td_t* result = td_execute(g, wj);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->type, ==, TD_TABLE);
+    munit_assert_int(td_table_nrows(result), ==, 2);
+
+    /* All agg values should be zero (no matches) */
+    td_t* score_col = td_table_get_col(result, n_score);
+    munit_assert_ptr_not_null(score_col);
+    int64_t* score_data = (int64_t*)td_data(score_col);
+    munit_assert_int(score_data[0], ==, 0);
+    munit_assert_int(score_data[1], ==, 0);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(left);
+    td_release(right);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
 /* ======================================================================
  * Suite
  * ====================================================================== */
@@ -981,6 +1202,9 @@ static MunitTest exec_tests[] = {
     { "/select",         test_exec_select,            NULL, NULL, 0, NULL },
     { "/stddev",         test_exec_stddev,            NULL, NULL, 0, NULL },
     { "/count_distinct", test_exec_count_distinct,    NULL, NULL, 0, NULL },
+    { "/window_join",    test_exec_window_join,       NULL, NULL, 0, NULL },
+    { "/window_join_no_sym", test_exec_window_join_no_sym, NULL, NULL, 0, NULL },
+    { "/window_join_empty",  test_exec_window_join_empty,  NULL, NULL, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL }
 };
 

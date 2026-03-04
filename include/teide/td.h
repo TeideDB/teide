@@ -470,6 +470,15 @@ typedef struct td_op_ext {
             uint8_t    n_join_keys;
             uint8_t    join_type;  /* 0=inner, 1=left, 2=full */
         } join;
+        struct {               /* OP_WINDOW_JOIN: ASOF window join */
+            td_op_t*   time_key;      /* time/ordered key column */
+            td_op_t*   sym_key;       /* optional symbol key (NULL = no partition) */
+            int64_t    window_lo;     /* lower bound of time window */
+            int64_t    window_hi;     /* upper bound of time window */
+            uint16_t*  agg_ops;       /* aggregation opcodes */
+            td_op_t**  agg_inputs;    /* aggregation input columns */
+            uint8_t    n_aggs;        /* number of aggregations */
+        } wjoin;
         struct {               /* OP_WINDOW: window functions */
             td_op_t**  part_keys;
             td_op_t**  order_keys;

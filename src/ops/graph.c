@@ -56,13 +56,19 @@ static void graph_fixup_ext_ptrs(td_graph_t* g, ptrdiff_t delta) {
                     ext->agg_ins[a] = graph_fix_ptr(ext->agg_ins[a], delta);
                 break;
             case OP_JOIN:
-            case OP_WINDOW_JOIN:
                 for (uint8_t k = 0; k < ext->join.n_join_keys; k++)
                     ext->join.left_keys[k] = graph_fix_ptr(ext->join.left_keys[k], delta);
                 if (ext->join.right_keys) {
                     for (uint8_t k = 0; k < ext->join.n_join_keys; k++)
                         ext->join.right_keys[k] = graph_fix_ptr(ext->join.right_keys[k], delta);
                 }
+                break;
+            case OP_WINDOW_JOIN:
+                ext->wjoin.time_key = &g->nodes[ext->wjoin.time_key->id];
+                if (ext->wjoin.sym_key)
+                    ext->wjoin.sym_key = &g->nodes[ext->wjoin.sym_key->id];
+                for (uint8_t k = 0; k < ext->wjoin.n_aggs; k++)
+                    ext->wjoin.agg_inputs[k] = &g->nodes[ext->wjoin.agg_inputs[k]->id];
                 break;
             case OP_WINDOW:
                 for (uint8_t k = 0; k < ext->window.n_part_keys; k++)
@@ -750,36 +756,43 @@ td_op_t* td_window_join(td_graph_t* g,
                          int64_t window_lo, int64_t window_hi,
                          uint16_t* agg_ops, td_op_t** agg_ins,
                          uint8_t n_aggs) {
-    uint32_t left_table_id = left_table->id;
-    uint32_t right_table_id = right_table->id;
+    uint32_t left_id  = left_table->id;
+    uint32_t right_id = right_table->id;
+    uint32_t time_id  = time_key->id;
+    uint32_t sym_id   = sym_key ? sym_key->id : UINT32_MAX;
     uint32_t agg_ids[256];
     for (uint8_t i = 0; i < n_aggs; i++) agg_ids[i] = agg_ins[i]->id;
 
-    (void)time_key; (void)sym_key;
-    (void)window_lo; (void)window_hi;
-    (void)agg_ops;
-
+    /* Trailing layout: [agg_ops: n_aggs*2B] [padding] [agg_inputs: n_aggs*ptr]
+     * Align agg_inputs to pointer size. */
+    size_t ops_sz = (size_t)n_aggs * sizeof(uint16_t);
+    size_t ops_padded = (ops_sz + sizeof(td_op_t*) - 1) & ~(sizeof(td_op_t*) - 1);
     size_t ins_sz = (size_t)n_aggs * sizeof(td_op_t*);
-    td_op_ext_t* ext = graph_alloc_ext_node_ex(g, ins_sz);
+    td_op_ext_t* ext = graph_alloc_ext_node_ex(g, ops_padded + ins_sz);
     if (!ext) return NULL;
 
-    left_table = &g->nodes[left_table_id];
-    right_table = &g->nodes[right_table_id];
+    left_table  = &g->nodes[left_id];
+    right_table = &g->nodes[right_id];
 
-    ext->base.opcode = OP_WINDOW_JOIN;
-    ext->base.arity = 2;
+    ext->base.opcode  = OP_WINDOW_JOIN;
+    ext->base.arity   = 2;
     ext->base.inputs[0] = left_table;
     ext->base.inputs[1] = right_table;
     ext->base.out_type = TD_TABLE;
     ext->base.est_rows = left_table->est_rows;
 
-    /* Array embedded in trailing space — freed with ext node */
-    ext->join.n_join_keys = n_aggs;
-    ext->join.join_type = 0;
-    ext->join.left_keys = (td_op_t**)EXT_TRAIL(ext);
+    char* trail = EXT_TRAIL(ext);
+    ext->wjoin.agg_ops    = (uint16_t*)trail;
+    ext->wjoin.agg_inputs = (td_op_t**)(trail + ops_padded);
+    memcpy(ext->wjoin.agg_ops, agg_ops, ops_sz);
     for (uint8_t i = 0; i < n_aggs; i++)
-        ext->join.left_keys[i] = &g->nodes[agg_ids[i]];
-    ext->join.right_keys = NULL;
+        ext->wjoin.agg_inputs[i] = &g->nodes[agg_ids[i]];
+
+    ext->wjoin.time_key  = &g->nodes[time_id];
+    ext->wjoin.sym_key   = (sym_id != UINT32_MAX) ? &g->nodes[sym_id] : NULL;
+    ext->wjoin.window_lo = window_lo;
+    ext->wjoin.window_hi = window_hi;
+    ext->wjoin.n_aggs    = n_aggs;
 
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
