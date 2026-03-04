@@ -176,18 +176,13 @@ static MunitResult test_filter_reorder_dag(const void* params, void* data) {
 }
 
 /*
- * Test: predicate pushdown past projection — correctness baseline.
+ * Test: predicate pushdown past projection.
  *
- * The pushdown optimization transforms:
- *   FILTER(id1 = 1, PROJECT([id1, v1], SCAN))
- * into:
- *   PROJECT([id1, v1], FILTER(id1 = 1, SCAN))
+ * Build: FILTER(id1 = 1, PROJECT([id1, v1], SCAN))
+ * After pushdown: PROJECT([id1, v1], FILTER(id1 = 1, SCAN))
  *
- * We verify the pushed-down form: filter first, then verify count.
- * Both column values (v1) and the predicate (id1=1) are correct
- * when the filter executes at the scan level.
- *
- * id1=1 rows: indices 0,1,6,9 → v1={10,20,70,100} → count=4, sum=200
+ * Verify both correctness and DAG structure.
+ * id1=1 rows: indices 0,1,6,9 → count=4
  */
 static MunitResult test_pushdown_past_project(const void* params, void* data) {
     (void)params; (void)data;
@@ -196,17 +191,29 @@ static MunitResult test_pushdown_past_project(const void* params, void* data) {
     td_t* tbl = make_test_table();
     td_graph_t* g = td_graph_new(tbl);
 
-    /* Build the pushed-down form: FILTER at scan level, then count */
+    /* Build: FILTER(pred, PROJECT([id1, v1], SCAN)) */
     td_op_t* v1   = td_scan(g, "v1");
     td_op_t* id1  = td_scan(g, "id1");
     td_op_t* c1   = td_const_i64(g, 1);
     td_op_t* pred = td_eq(g, id1, c1);
-    td_op_t* filt = td_filter(g, v1, pred);
-    td_op_t* cnt  = td_count(g, filt);
 
+    td_op_t* proj_cols[] = { id1, v1 };
+    td_op_t* proj = td_project(g, v1, proj_cols, 2);
+    uint32_t proj_id = proj->id;
+    td_op_t* filt = td_filter(g, proj, pred);
+
+    /* Verify DAG structure after optimization: filter should be below project.
+     * td_optimize returns the node at root's original ID (the FILTER),
+     * so check the PROJECT node directly to verify it now wraps the FILTER. */
+    td_optimize(g, filt);
+    td_op_t* proj_after = &g->nodes[proj_id];
+    munit_assert_int(proj_after->opcode, ==, OP_PROJECT);
+    munit_assert_int(proj_after->inputs[0]->opcode, ==, OP_FILTER);
+
+    /* Verify correctness */
+    td_op_t* cnt = td_count(g, filt);
     td_t* result = td_execute(g, cnt);
     munit_assert_false(TD_IS_ERR(result));
-    /* id1=1 appears 4 times in the data */
     munit_assert_int(result->i64, ==, 4);
 
     td_release(result);
@@ -223,7 +230,7 @@ static MunitResult test_pushdown_past_project(const void* params, void* data) {
  * Build: FILTER(id1 = 1, GROUP(id1, SUM(v1)))
  * After: GROUP(id1, SUM(v1), FILTER(id1 = 1, ...))
  *
- * Result should be single group: id1=1, sum=200
+ * Verify DAG structure and correctness. Result: id1=1, sum=200
  */
 static MunitResult test_pushdown_past_group(const void* params, void* data) {
     (void)params; (void)data;
@@ -239,16 +246,18 @@ static MunitResult test_pushdown_past_group(const void* params, void* data) {
     td_op_t* agg_ins[] = { val };
     td_op_t* grp = td_group(g, keys, 1, agg_ops, agg_ins, 1);
 
-    /* Filter on the group key column (id1 = 1) — should push down */
+    /* Filter on the group key column (id1 = 1).
+     * GROUP pushdown is disabled (executor key/agg scans bypass filter),
+     * so this tests FILTER-above-GROUP correctness only. */
     td_op_t* id1_scan = td_scan(g, "id1");
     td_op_t* c1 = td_const_i64(g, 1);
     td_op_t* pred = td_eq(g, id1_scan, c1);
     td_op_t* filt = td_filter(g, grp, pred);
 
+    /* Verify correctness */
     td_t* result = td_execute(g, filt);
     munit_assert_false(TD_IS_ERR(result));
 
-    /* With or without pushdown, result should be: id1=1, sum(v1)=200 */
     munit_assert_int(result->type, ==, TD_TABLE);
     munit_assert_int(td_table_nrows(result), ==, 1);
     td_t* sum_col = td_table_get_col_idx(result, 1);

@@ -1008,60 +1008,29 @@ static int collect_pred_scans(td_graph_t* g, td_op_t* pred,
     return n;
 }
 
-/* Check if all scan IDs in the predicate reference columns from a
- * specific table (identified by table_id stored in pad[0..1]).
- * Returns the table_id if uniform, or -1 if mixed/unknown. */
-static int pred_table_id(td_graph_t* g, td_op_t* pred) {
-    uint32_t scan_ids[64];
-    int n = collect_pred_scans(g, pred, scan_ids, 64);
-    if (n == 0) return -1;
-
-    int first_tid = -1;
-    for (int i = 0; i < n; i++) {
-        td_op_ext_t* ext = find_ext(g, scan_ids[i]);
-        if (!ext) return -1;
-        uint16_t stored = 0;
-        memcpy(&stored, ext->base.pad, sizeof(uint16_t));
-        int tid = (int)stored;
-        if (first_tid == -1) first_tid = tid;
-        else if (tid != first_tid) return -1;
-    }
-    return first_tid;
-}
-
-/* Check if a predicate only references columns that are group keys. */
-static bool pred_refs_only_keys(td_graph_t* g, td_op_t* pred,
-                                td_op_ext_t* grp_ext) {
-    uint32_t scan_ids[64];
-    int n = collect_pred_scans(g, pred, scan_ids, 64);
-    if (n == 0) return false;
-
-    for (int i = 0; i < n; i++) {
-        td_op_ext_t* scan_ext = find_ext(g, scan_ids[i]);
-        if (!scan_ext) return false;
-        bool is_key = false;
-        for (uint8_t k = 0; k < grp_ext->n_keys; k++) {
-            if (!grp_ext->keys[k]) continue;
-            td_op_ext_t* key_ext = find_ext(g, grp_ext->keys[k]->id);
-            if (key_ext && key_ext->base.opcode == OP_SCAN &&
-                key_ext->sym == scan_ext->sym) {
-                is_key = true;
-                break;
-            }
+/* Redirect all consumers of old_id to point to new_target instead.
+ * Skips nodes with IDs skip_a and skip_b (the swapped pair). */
+static void redirect_consumers(td_graph_t* g, uint32_t old_id,
+                               td_op_t* new_target,
+                               uint32_t skip_a, uint32_t skip_b) {
+    uint32_t nc = g->node_count;
+    for (uint32_t j = 0; j < nc; j++) {
+        td_op_t* c = &g->nodes[j];
+        if (c->flags & OP_FLAG_DEAD || j == skip_a || j == skip_b) continue;
+        for (int k = 0; k < c->arity && k < 2; k++) {
+            if (c->inputs[k] && c->inputs[k]->id == old_id)
+                c->inputs[k] = new_target;
         }
-        if (!is_key) return false;
     }
-    return true;
 }
 
 static void pass_predicate_pushdown(td_graph_t* g, td_op_t* root) {
     if (!g || !root) return;
 
-    uint32_t nc = g->node_count;
     /* Multiple iterations: pushdown may enable further pushdowns */
     for (int iter = 0; iter < 4; iter++) {
         bool changed = false;
-        nc = g->node_count;
+        uint32_t nc = g->node_count;
 
         for (uint32_t i = 0; i < nc; i++) {
             td_op_t* n = &g->nodes[i];
@@ -1079,81 +1048,17 @@ static void pass_predicate_pushdown(td_graph_t* g, td_op_t* root) {
                 td_op_t* proj_input = child->inputs[0];
                 n->inputs[0] = proj_input;
                 child->inputs[0] = n;
-                g->nodes[n->id] = *n;
-                g->nodes[child->id] = *child;
-
-                /* Update any consumers of n to point to child instead */
-                for (uint32_t j = 0; j < nc; j++) {
-                    td_op_t* c = &g->nodes[j];
-                    if (c->flags & OP_FLAG_DEAD || j == child->id || j == n->id) continue;
-                    for (int k = 0; k < c->arity && k < 2; k++) {
-                        if (c->inputs[k] && c->inputs[k]->id == n->id) {
-                            c->inputs[k] = child;
-                            g->nodes[j] = *c;
-                        }
-                    }
-                }
+                redirect_consumers(g, n->id, child, child->id, n->id);
                 changed = true;
                 continue;
             }
 
-            /* Push past GROUP (key-only predicates) */
-            if (child->opcode == OP_GROUP) {
-                td_op_ext_t* grp_ext = find_ext(g, child->id);
-                if (!grp_ext) continue;
-
-                if (pred_refs_only_keys(g, pred, grp_ext)) {
-                    /* Swap: FILTER(pred, GROUP(x)) -> GROUP(FILTER(pred, x)) */
-                    td_op_t* grp_input = child->inputs[0];
-                    n->inputs[0] = grp_input;
-                    child->inputs[0] = n;
-                    g->nodes[n->id] = *n;
-                    g->nodes[child->id] = *child;
-
-                    for (uint32_t j = 0; j < nc; j++) {
-                        td_op_t* c = &g->nodes[j];
-                        if (c->flags & OP_FLAG_DEAD || j == child->id || j == n->id) continue;
-                        for (int k = 0; k < c->arity && k < 2; k++) {
-                            if (c->inputs[k] && c->inputs[k]->id == n->id) {
-                                c->inputs[k] = child;
-                                g->nodes[j] = *c;
-                            }
-                        }
-                    }
-                    changed = true;
-                    continue;
-                }
-            }
-
-            /* Push past JOIN (one-sided predicates) */
-            if (child->opcode == OP_JOIN) {
-                td_op_ext_t* join_ext = find_ext(g, child->id);
-                if (!join_ext) continue;
-
-                /* Determine which side the predicate references */
-                int ptid = pred_table_id(g, pred);
-                if (ptid < 0) continue;  /* mixed or unknown */
-
-                /* Check left side table_id */
-                td_op_t* left = child->inputs[0];
-                td_op_t* right = child->inputs[1];
-                if (!left || !right) continue;
-
-                /* For single-table joins (both sides from g->table),
-                 * we can't distinguish sides by table_id alone.
-                 * Skip this optimization for now. */
-                if (ptid == 0) continue;
-
-                /* Multi-table join: push to matching side */
-                /* (This handles td_scan_table with explicit table_id) */
-                /* TODO: implement multi-table predicate pushdown */
-                continue;
-            }
+            /* GROUP pushdown disabled: the executor's key/agg scans
+             * bypass the filter, producing wrong results. Needs executor
+             * support for filtered scan propagation before enabling. */
 
             /* Push past EXPAND (source-side predicates) */
             if (child->opcode == OP_EXPAND) {
-                /* Check if predicate only references source-side scans.
-                 * Source side is child->inputs[0] (the input to expand). */
                 uint32_t scan_ids[64];
                 int n_scans = collect_pred_scans(g, pred, scan_ids, 64);
                 if (n_scans == 0) continue;
@@ -1174,19 +1079,7 @@ static void pass_predicate_pushdown(td_graph_t* g, td_op_t* root) {
                 td_op_t* expand_src = child->inputs[0];
                 n->inputs[0] = expand_src;
                 child->inputs[0] = n;
-                g->nodes[n->id] = *n;
-                g->nodes[child->id] = *child;
-
-                for (uint32_t j = 0; j < nc; j++) {
-                    td_op_t* c = &g->nodes[j];
-                    if (c->flags & OP_FLAG_DEAD || j == child->id || j == n->id) continue;
-                    for (int k = 0; k < c->arity && k < 2; k++) {
-                        if (c->inputs[k] && c->inputs[k]->id == n->id) {
-                            c->inputs[k] = child;
-                            g->nodes[j] = *c;
-                        }
-                    }
-                }
+                redirect_consumers(g, n->id, child, child->id, n->id);
                 changed = true;
                 continue;
             }
@@ -1306,7 +1199,7 @@ static void pass_filter_reorder(td_graph_t* g, td_op_t* root) {
                 if (c->flags & OP_FLAG_DEAD) continue;
                 for (int k = 0; k < c->arity && k < 2; k++) {
                     if (c->inputs[k] && c->inputs[k]->id == n->id &&
-                        c->id != new_outer->id && c->opcode != OP_FILTER) {
+                        c->id != new_outer->id) {
                         c->inputs[k] = new_outer;
                         g->nodes[j] = *c;
                     }
@@ -1392,11 +1285,11 @@ td_op_t* td_optimize(td_graph_t* g, td_op_t* root) {
     /* Pass 4: Factorized detection (OP_EXPAND → OP_GROUP optimization) */
     factorize_pass(g, root);
 
-    /* Pass 5: Filter reordering (split ANDs + reorder by cost) */
-    pass_filter_reorder(g, root);
-
-    /* Pass 6: Predicate pushdown */
+    /* Pass 5: Predicate pushdown */
     pass_predicate_pushdown(g, root);
+
+    /* Pass 6: Filter reordering (split ANDs + reorder by cost) */
+    pass_filter_reorder(g, root);
 
     /* Pass 7: Fusion */
     td_fuse_pass(g, root);

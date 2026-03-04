@@ -28,7 +28,7 @@ Core abstraction is `td_t` — a 32-byte block header. Every object (atom, vecto
 
 **Execution pipeline**:
 1. Build lazy DAG: `td_graph_new(df)` → `td_scan/td_add/td_filter/...` → `td_execute(g, root)`
-2. Optimizer: type inference → constant fold → SIP → factorize → fusion → DCE
+2. Optimizer: type inference → constant fold → SIP → factorize → predicate pushdown → filter reorder → fusion → DCE
 3. Fused executor: bytecode over register slots, morsel-by-morsel (1024 elements)
 
 **Graph engine**: CSR edge indices (`td_csr_t`, `td_rel_t`) alongside columnar tables.
@@ -54,8 +54,9 @@ include/teide/td.h         Single public header (all types, opcodes, API)
 src/store/csr.{h,c}        CSR storage — build, save, load, mmap, free
 src/ops/graph.c             DAG construction (td_expand, td_var_expand, etc.)
 src/ops/exec.c              Fused morsel-driven executor (all opcodes)
-src/ops/opt.c               Optimizer passes (type inference, SIP, factorize, fusion, DCE)
+src/ops/opt.c               Optimizer passes (type inference, SIP, factorize, predicate pushdown, filter reorder, fusion, DCE)
 src/ops/lftj.{h,c}         Leapfrog Triejoin — iterator, search, enumeration
 src/ops/fvec.{h,c}         Factorized vectors — td_fvec_t, td_ftable_t
 test/test_csr.c             Graph engine tests (42 tests)
+test/test_opt.c             Optimizer pass tests (filter reorder, predicate pushdown)
 ```
