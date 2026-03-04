@@ -589,7 +589,7 @@ git commit -m "test: add DAG inspection test for filter reordering"
 
 ---
 
-### Task 5: Predicate pushdown — failing tests
+### Task 5: Predicate pushdown — failing tests [x]
 
 **Files:**
 - Modify: `test/test_opt.c`

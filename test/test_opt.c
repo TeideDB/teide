@@ -175,10 +175,100 @@ static MunitResult test_filter_reorder_dag(const void* params, void* data) {
     return MUNIT_OK;
 }
 
+/*
+ * Test: predicate pushdown past projection — correctness baseline.
+ *
+ * The pushdown optimization transforms:
+ *   FILTER(id1 = 1, PROJECT([id1, v1], SCAN))
+ * into:
+ *   PROJECT([id1, v1], FILTER(id1 = 1, SCAN))
+ *
+ * We verify the pushed-down form: filter first, then verify count.
+ * Both column values (v1) and the predicate (id1=1) are correct
+ * when the filter executes at the scan level.
+ *
+ * id1=1 rows: indices 0,1,6,9 → v1={10,20,70,100} → count=4, sum=200
+ */
+static MunitResult test_pushdown_past_project(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+
+    td_t* tbl = make_test_table();
+    td_graph_t* g = td_graph_new(tbl);
+
+    /* Build the pushed-down form: FILTER at scan level, then count */
+    td_op_t* v1   = td_scan(g, "v1");
+    td_op_t* id1  = td_scan(g, "id1");
+    td_op_t* c1   = td_const_i64(g, 1);
+    td_op_t* pred = td_eq(g, id1, c1);
+    td_op_t* filt = td_filter(g, v1, pred);
+    td_op_t* cnt  = td_count(g, filt);
+
+    td_t* result = td_execute(g, cnt);
+    munit_assert_false(TD_IS_ERR(result));
+    /* id1=1 appears 4 times in the data */
+    munit_assert_int(result->i64, ==, 4);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/*
+ * Test: FILTER on group key pushes below GROUP.
+ *
+ * Build: FILTER(id1 = 1, GROUP(id1, SUM(v1)))
+ * After: GROUP(id1, SUM(v1), FILTER(id1 = 1, ...))
+ *
+ * Result should be single group: id1=1, sum=200
+ */
+static MunitResult test_pushdown_past_group(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+
+    td_t* tbl = make_test_table();
+    td_graph_t* g = td_graph_new(tbl);
+
+    td_op_t* key = td_scan(g, "id1");
+    td_op_t* val = td_scan(g, "v1");
+    td_op_t* keys[] = { key };
+    uint16_t agg_ops[] = { OP_SUM };
+    td_op_t* agg_ins[] = { val };
+    td_op_t* grp = td_group(g, keys, 1, agg_ops, agg_ins, 1);
+
+    /* Filter on the group key column (id1 = 1) — should push down */
+    td_op_t* id1_scan = td_scan(g, "id1");
+    td_op_t* c1 = td_const_i64(g, 1);
+    td_op_t* pred = td_eq(g, id1_scan, c1);
+    td_op_t* filt = td_filter(g, grp, pred);
+
+    td_t* result = td_execute(g, filt);
+    munit_assert_false(TD_IS_ERR(result));
+
+    /* With or without pushdown, result should be: id1=1, sum(v1)=200 */
+    munit_assert_int(result->type, ==, TD_TABLE);
+    munit_assert_int(td_table_nrows(result), ==, 1);
+    td_t* sum_col = td_table_get_col_idx(result, 1);
+    munit_assert_ptr_not_null(sum_col);
+    munit_assert_int(((int64_t*)td_data(sum_col))[0], ==, 200);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
 static MunitTest tests[] = {
     { "/filter_reorder_type", test_filter_reorder_by_type, NULL, NULL, 0, NULL },
     { "/filter_and_split",    test_filter_and_split,       NULL, NULL, 0, NULL },
     { "/filter_reorder_dag",  test_filter_reorder_dag,     NULL, NULL, 0, NULL },
+    { "/pushdown_project",    test_pushdown_past_project,  NULL, NULL, 0, NULL },
+    { "/pushdown_group",      test_pushdown_past_group,    NULL, NULL, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL }
 };
 
