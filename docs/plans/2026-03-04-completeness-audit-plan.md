@@ -10,7 +10,7 @@
 
 ---
 
-## Task 1: Add test_exec.c skeleton — unary element-wise ops
+## Task 1: Add test_exec.c skeleton — unary element-wise ops [x]
 
 **Files:**
 - Create: `test/test_exec.c`
