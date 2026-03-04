@@ -26,7 +26,14 @@
 #include <stdio.h>
 #include <unistd.h>
 
-#define TMP_CSV "/tmp/teide_test.csv"
+static char tmp_csv_path[64];
+static const char* tmp_csv(void) {
+    if (!tmp_csv_path[0])
+        snprintf(tmp_csv_path, sizeof(tmp_csv_path),
+                 "/tmp/teide_test_%d.csv", (int)getpid());
+    return tmp_csv_path;
+}
+#define TMP_CSV tmp_csv()
 
 static MunitResult test_csv_roundtrip_i64(const void* params, void* data) {
     (void)params; (void)data;

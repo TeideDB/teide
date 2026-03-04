@@ -1665,15 +1665,23 @@ static td_t* exec_count_distinct(td_graph_t* g, td_op_t* op, td_t* input) {
 
     if (len == 0) return td_i64(0);
 
-    /* Only numeric/ordinal column types are supported */
-    if (in_type <= 0 || in_type == TD_TABLE)
+    /* Only numeric/ordinal/sym column types are supported */
+    switch (in_type) {
+    case TD_BOOL: case TD_U8: case TD_CHAR:
+    case TD_I16: case TD_I32: case TD_I64:
+    case TD_F64: case TD_DATE: case TD_TIME: case TD_TIMESTAMP:
+    case TD_SYM:
+        break;
+    default:
         return TD_ERR_PTR(TD_ERR_TYPE);
+    }
 
     /* Use a simple open-addressing hash set for int64 values */
-    int64_t cap = len < 16 ? 32 : len * 2;
+    uint64_t cap = (uint64_t)(len < 16 ? 32 : len) * 2;
     /* Round up to power of 2 */
-    int64_t c = 1;
-    while (c < cap) c <<= 1;
+    uint64_t c = 1;
+    while (c && c < cap) c <<= 1;
+    if (!c) return TD_ERR_PTR(TD_ERR_OOM); /* overflow: cap too large */
     cap = c;
 
     td_t* set_hdr;
@@ -1689,13 +1697,16 @@ static td_t* exec_count_distinct(td_graph_t* g, td_op_t* op, td_t* input) {
     }
 
     int64_t count = 0;
-    int64_t mask = cap - 1;
+    uint64_t mask = cap - 1;
     void* base = td_data(input);
 
     for (int64_t i = 0; i < len; i++) {
         int64_t val;
         if (in_type == TD_F64) {
             double fv = ((double*)base)[i];
+            /* Normalize: NaN → canonical NaN, -0.0 → +0.0 */
+            if (fv != fv) fv = (double)NAN;        /* canonical NaN */
+            else if (fv == 0.0) fv = 0.0;          /* +0.0 */
             memcpy(&val, &fv, sizeof(int64_t));
         } else {
             val = read_col_i64(base, i, in_type, input->attrs);
@@ -1703,7 +1714,7 @@ static td_t* exec_count_distinct(td_graph_t* g, td_op_t* op, td_t* input) {
 
         /* Open-addressing linear probe */
         uint64_t h = (uint64_t)val * 0x9E3779B97F4A7C15ULL;
-        int64_t slot = (int64_t)(h & (uint64_t)mask);
+        uint64_t slot = h & mask;
         while (used[slot]) {
             if (set[slot] == val) goto next_val;
             slot = (slot + 1) & mask;
