@@ -222,7 +222,7 @@ git commit -m "test: add filter reordering correctness tests"
 
 ---
 
-### Task 3: Filter reordering — implementation
+### Task 3: Filter reordering — implementation [x]
 
 **Files:**
 - Modify: `src/ops/opt.c:875-899`

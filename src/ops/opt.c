@@ -869,6 +869,279 @@ static void factorize_pass(td_graph_t* g, td_op_t* root) {
 }
 
 /* --------------------------------------------------------------------------
+ * Pass: Filter reordering
+ *
+ * Reorder chained OP_FILTER nodes so cheapest predicates execute first.
+ * Also splits AND trees into separate chained filters.
+ * -------------------------------------------------------------------------- */
+
+/* Allocate a new node in the graph (for use during optimization passes).
+ * Same logic as graph_alloc_node in graph.c but local to opt.c. */
+static td_op_t* graph_alloc_node_opt(td_graph_t* g) {
+    if (g->node_count >= g->node_cap) {
+        if (g->node_cap > UINT32_MAX / 2) return NULL;
+        uint32_t new_cap = g->node_cap * 2;
+        uintptr_t old_base = (uintptr_t)g->nodes;
+        td_op_t* new_nodes = (td_op_t*)td_sys_realloc(g->nodes,
+                                                       new_cap * sizeof(td_op_t));
+        if (!new_nodes) return NULL;
+        g->nodes = new_nodes;
+        g->node_cap = new_cap;
+        /* Fix up all input pointers after realloc */
+        ptrdiff_t delta = (ptrdiff_t)((uintptr_t)g->nodes - old_base);
+        if (delta != 0) {
+            for (uint32_t i = 0; i < g->node_count; i++) {
+                if (g->nodes[i].inputs[0])
+                    g->nodes[i].inputs[0] = (td_op_t*)((char*)g->nodes[i].inputs[0] + delta);
+                if (g->nodes[i].inputs[1])
+                    g->nodes[i].inputs[1] = (td_op_t*)((char*)g->nodes[i].inputs[1] + delta);
+            }
+            /* Fix ext node input pointers */
+            for (uint32_t i = 0; i < g->ext_count; i++) {
+                if (g->ext_nodes[i]) {
+                    if (g->ext_nodes[i]->base.inputs[0])
+                        g->ext_nodes[i]->base.inputs[0] =
+                            (td_op_t*)((char*)g->ext_nodes[i]->base.inputs[0] + delta);
+                    if (g->ext_nodes[i]->base.inputs[1])
+                        g->ext_nodes[i]->base.inputs[1] =
+                            (td_op_t*)((char*)g->ext_nodes[i]->base.inputs[1] + delta);
+                    /* Fix structural op column pointers */
+                    switch (g->ext_nodes[i]->base.opcode) {
+                        case OP_GROUP:
+                            for (uint8_t k = 0; k < g->ext_nodes[i]->n_keys; k++)
+                                if (g->ext_nodes[i]->keys[k])
+                                    g->ext_nodes[i]->keys[k] =
+                                        (td_op_t*)((char*)g->ext_nodes[i]->keys[k] + delta);
+                            for (uint8_t a = 0; a < g->ext_nodes[i]->n_aggs; a++)
+                                if (g->ext_nodes[i]->agg_ins[a])
+                                    g->ext_nodes[i]->agg_ins[a] =
+                                        (td_op_t*)((char*)g->ext_nodes[i]->agg_ins[a] + delta);
+                            break;
+                        case OP_SORT:
+                        case OP_PROJECT:
+                        case OP_SELECT:
+                            for (uint8_t k = 0; k < g->ext_nodes[i]->sort.n_cols; k++)
+                                if (g->ext_nodes[i]->sort.columns[k])
+                                    g->ext_nodes[i]->sort.columns[k] =
+                                        (td_op_t*)((char*)g->ext_nodes[i]->sort.columns[k] + delta);
+                            break;
+                        case OP_JOIN:
+                        case OP_WINDOW_JOIN:
+                            for (uint8_t k = 0; k < g->ext_nodes[i]->join.n_join_keys; k++) {
+                                if (g->ext_nodes[i]->join.left_keys[k])
+                                    g->ext_nodes[i]->join.left_keys[k] =
+                                        (td_op_t*)((char*)g->ext_nodes[i]->join.left_keys[k] + delta);
+                                if (g->ext_nodes[i]->join.right_keys &&
+                                    g->ext_nodes[i]->join.right_keys[k])
+                                    g->ext_nodes[i]->join.right_keys[k] =
+                                        (td_op_t*)((char*)g->ext_nodes[i]->join.right_keys[k] + delta);
+                            }
+                            break;
+                        case OP_WINDOW:
+                            for (uint8_t k = 0; k < g->ext_nodes[i]->window.n_part_keys; k++)
+                                if (g->ext_nodes[i]->window.part_keys[k])
+                                    g->ext_nodes[i]->window.part_keys[k] =
+                                        (td_op_t*)((char*)g->ext_nodes[i]->window.part_keys[k] + delta);
+                            for (uint8_t k = 0; k < g->ext_nodes[i]->window.n_order_keys; k++)
+                                if (g->ext_nodes[i]->window.order_keys[k])
+                                    g->ext_nodes[i]->window.order_keys[k] =
+                                        (td_op_t*)((char*)g->ext_nodes[i]->window.order_keys[k] + delta);
+                            for (uint8_t f = 0; f < g->ext_nodes[i]->window.n_funcs; f++)
+                                if (g->ext_nodes[i]->window.func_inputs[f])
+                                    g->ext_nodes[i]->window.func_inputs[f] =
+                                        (td_op_t*)((char*)g->ext_nodes[i]->window.func_inputs[f] + delta);
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+        }
+    }
+    td_op_t* n = &g->nodes[g->node_count];
+    memset(n, 0, sizeof(td_op_t));
+    n->id = g->node_count;
+    g->node_count++;
+    return n;
+}
+
+/* Score a predicate subtree: lower = cheaper = execute first. */
+static int filter_cost(td_graph_t* g, td_op_t* pred) {
+    (void)g;
+    if (!pred) return 99;
+    int cost = 0;
+
+    /* Constant comparison: one input is OP_CONST */
+    bool has_const = false;
+    for (int i = 0; i < pred->arity && i < 2; i++) {
+        if (pred->inputs[i] && pred->inputs[i]->opcode == OP_CONST)
+            has_const = true;
+    }
+    if (!has_const) cost += 4;  /* col-col comparison */
+
+    /* Type width cost */
+    int8_t t = pred->out_type;
+    if (pred->arity >= 1 && pred->inputs[0])
+        t = pred->inputs[0]->out_type;
+    switch (t) {
+        case TD_BOOL: case TD_U8:  cost += 0; break;
+        case TD_I16:               cost += 1; break;
+        case TD_I32:  case TD_DATE: case TD_TIME: cost += 2; break;
+        default:                   cost += 3; break;  /* I64, F64, SYM, STR */
+    }
+
+    /* Comparison type cost */
+    switch (pred->opcode) {
+        case OP_EQ: case OP_NE:    cost += 0; break;
+        case OP_LT: case OP_LE:
+        case OP_GT: case OP_GE:    cost += 2; break;
+        case OP_LIKE: case OP_ILIKE: cost += 4; break;
+        default:                   cost += 1; break;
+    }
+
+    return cost;
+}
+
+/* Split FILTER(AND(a, b), input) into FILTER(a, FILTER(b, input)).
+ * Returns the new outer filter node, or the original if no split. */
+static td_op_t* split_and_filter(td_graph_t* g, td_op_t* filter_node) {
+    if (!filter_node || filter_node->opcode != OP_FILTER) return filter_node;
+    if (filter_node->arity != 2) return filter_node;
+
+    td_op_t* pred = filter_node->inputs[1];
+    if (!pred || pred->opcode != OP_AND || pred->arity != 2) return filter_node;
+
+    td_op_t* pred_a = pred->inputs[0];
+    td_op_t* pred_b = pred->inputs[1];
+    td_op_t* input  = filter_node->inputs[0];
+    if (!pred_a || !pred_b || !input) return filter_node;
+
+    /* Save IDs before potential realloc */
+    uint32_t filter_id = filter_node->id;
+    uint32_t pred_b_id = pred_b->id;
+
+    /* Rewrite: filter_node becomes FILTER(pred_a, input) */
+    filter_node->inputs[1] = pred_a;
+    g->nodes[filter_node->id] = *filter_node;
+
+    /* Allocate new outer filter */
+    td_op_t* outer = graph_alloc_node_opt(g);
+    if (!outer) return &g->nodes[filter_id];  /* OOM: leave unsplit */
+
+    /* Re-fetch after potential realloc */
+    filter_node = &g->nodes[filter_id];
+    pred_b = &g->nodes[pred_b_id];
+
+    outer->opcode = OP_FILTER;
+    outer->arity = 2;
+    outer->inputs[0] = filter_node;
+    outer->inputs[1] = pred_b;
+    outer->out_type = filter_node->out_type;
+    outer->est_rows = filter_node->est_rows;
+
+    return outer;
+}
+
+/* Collect a chain of OP_FILTER nodes. Returns count (max 64). */
+static int collect_filter_chain(td_op_t* top, td_op_t** chain, int max) {
+    int n = 0;
+    td_op_t* cur = top;
+    while (cur && cur->opcode == OP_FILTER && n < max) {
+        chain[n++] = cur;
+        cur = cur->inputs[0];
+    }
+    return n;
+}
+
+static void pass_filter_reorder(td_graph_t* g, td_op_t* root) {
+    if (!g || !root) return;
+
+    uint32_t nc = g->node_count;
+
+    /* First pass: split AND predicates in filters */
+    for (uint32_t i = 0; i < nc; i++) {
+        td_op_t* n = &g->nodes[i];
+        if (n->flags & OP_FLAG_DEAD) continue;
+        if (n->opcode != OP_FILTER) continue;
+        if (n->arity != 2 || !n->inputs[1]) continue;
+        if (n->inputs[1]->opcode != OP_AND) continue;
+
+        /* Split AND and update consumers to point to new outer */
+        td_op_t* new_outer = split_and_filter(g, n);
+        if (new_outer != n) {
+            /* Update all consumers of old node to point to new outer */
+            uint32_t new_nc = g->node_count;
+            for (uint32_t j = 0; j < new_nc; j++) {
+                td_op_t* c = &g->nodes[j];
+                if (c->flags & OP_FLAG_DEAD) continue;
+                for (int k = 0; k < c->arity && k < 2; k++) {
+                    if (c->inputs[k] && c->inputs[k]->id == n->id &&
+                        c->id != new_outer->id && c->opcode != OP_FILTER) {
+                        c->inputs[k] = new_outer;
+                        g->nodes[j] = *c;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Second pass: reorder filter chains by cost.
+     * Use insertion sort on chain arrays (chains are typically short). */
+    nc = g->node_count;  /* may have grown from splits */
+    bool* visited = NULL;
+    bool visited_stack[256];
+    if (nc <= 256) {
+        visited = visited_stack;
+    } else {
+        visited = (bool*)td_sys_alloc(nc * sizeof(bool));
+        if (!visited) return;
+    }
+    memset(visited, 0, nc * sizeof(bool));
+
+    for (uint32_t i = 0; i < nc; i++) {
+        td_op_t* n = &g->nodes[i];
+        if (n->flags & OP_FLAG_DEAD) continue;
+        if (n->opcode != OP_FILTER) continue;
+        if (visited[i]) continue;
+
+        /* Collect the filter chain starting at this node */
+        td_op_t* chain[64];
+        int chain_len = collect_filter_chain(n, chain, 64);
+        if (chain_len < 2) {
+            for (int c = 0; c < chain_len; c++) visited[chain[c]->id] = true;
+            continue;
+        }
+
+        /* Mark all as visited */
+        for (int c = 0; c < chain_len; c++) visited[chain[c]->id] = true;
+
+        /* Score each filter's predicate */
+        int costs[64];
+        for (int c = 0; c < chain_len; c++)
+            costs[c] = filter_cost(g, chain[c]->inputs[1]);
+
+        /* Insertion sort predicates by cost (stable: preserves original
+         * order for equal costs). We swap predicates, not filter nodes. */
+        for (int c = 1; c < chain_len; c++) {
+            td_op_t* pred = chain[c]->inputs[1];
+            int cost = costs[c];
+            int j = c - 1;
+            while (j >= 0 && costs[j] > cost) {
+                chain[j + 1]->inputs[1] = chain[j]->inputs[1];
+                g->nodes[chain[j + 1]->id].inputs[1] = chain[j]->inputs[1];
+                costs[j + 1] = costs[j];
+                j--;
+            }
+            chain[j + 1]->inputs[1] = pred;
+            g->nodes[chain[j + 1]->id].inputs[1] = pred;
+            costs[j + 1] = cost;
+        }
+    }
+
+    if (nc > 256) td_sys_free(visited);
+}
+
+/* --------------------------------------------------------------------------
  * td_optimize — run all passes in order, return (possibly updated) root
  * -------------------------------------------------------------------------- */
 
@@ -887,10 +1160,13 @@ td_op_t* td_optimize(td_graph_t* g, td_op_t* root) {
     /* Pass 4: Factorized detection (OP_EXPAND → OP_GROUP optimization) */
     factorize_pass(g, root);
 
-    /* Pass 5: Fusion */
+    /* Pass 5: Filter reordering (split ANDs + reorder by cost) */
+    pass_filter_reorder(g, root);
+
+    /* Pass 6: Fusion */
     td_fuse_pass(g, root);
 
-    /* Pass 6: DCE */
+    /* Pass 7: DCE */
     pass_dce(g, root);
 
     /* Return root — may have been replaced during folding.
