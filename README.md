@@ -49,82 +49,15 @@ fused pipeline.
 
 ## Architecture
 
-```
-                        User Code
-                            |
-                     td_graph_new(tbl)
-                            |
-                    +-------v--------+
-                    |  Lazy DAG      |
-                    |  td_scan       |
-                    |  td_filter     |
-                    |  td_group      |
-                    |  td_expand     |
-                    |  td_join       |
-                    +-------+--------+
-                            |
-                     td_optimize(g, root)
-                            |
-          +-----------------v------------------+
-          |         Optimizer Passes            |
-          |                                    |
-          |  1. Type inference                 |
-          |  2. Constant folding               |
-          |  3. SIP (sideways info passing)    |
-          |  4. Factorize                      |
-          |  5. Predicate pushdown             |
-          |  6. Filter reorder                 |
-          |  7. Fusion                         |
-          |  8. Dead code elimination          |
-          +-----------------+------------------+
-                            |
-                     td_execute(g, root)
-                            |
-          +-----------------v------------------+
-          |      Fused Morsel Executor         |
-          |                                    |
-          |  Bytecode over register slots      |
-          |  1024-element morsels              |
-          |  Parallel thread pool dispatch     |
-          +-----------------+------------------+
-                            |
-                        td_t* result
-```
+<picture>
+  <img src="docs/architecture.svg" alt="Architecture: User Code → Lazy DAG → Optimizer → Fused Morsel Executor → Result" width="520">
+</picture>
 
 ## Memory Model
 
-```
-  +---------------------------------------------------+
-  |                   Heap (td_heap_t)                 |
-  |                                                    |
-  |  +-----------+  +-----------+       +-----------+  |
-  |  | Pool 0    |  | Pool 1    |  ...  | Pool N    |  |
-  |  | 2^20 B    |  | 2^20 B    |       | 2^20 B    |  |
-  |  +-----------+  +-----------+       +-----------+  |
-  |                                                    |
-  |  Free lists: order 6 (64B) .. order 30 (1GB)      |
-  |  Buddy split/coalesce on alloc/free                |
-  +---------------------------------------------------+
-            |                         |
-  +---------v----------+    +---------v----------+
-  |   Slab Cache       |    |   Thread-Local     |
-  |   Orders 0..4      |    |   Arena            |
-  |   Fast path for    |    |   Lock-free alloc  |
-  |   small objects    |    |   Foreign-block    |
-  |   (<=512 B)        |    |   deferred free    |
-  +--------------------+    +--------------------+
-
-  Every td_t is a 32-byte aligned block:
-  +--------+--------+--------+--------+
-  | nullmap / slice / ext_nullmap (16B)|
-  +--------+--------+--------+--------+
-  | mmod | order | type | attrs | rc  |  (8B)
-  +------+-------+------+-------+-----+
-  | value / len                  (8B)  |
-  +------------------------------------+
-  | data[]  (flexible array member)    |
-  +------------------------------------+
-```
+<picture>
+  <img src="docs/memory.svg" alt="Memory Model: Heap with buddy allocator, slab cache, thread-local arenas, td_t block layout" width="600">
+</picture>
 
 ## Build
 

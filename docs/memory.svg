@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 560" font-family="'SF Mono','Fira Code','Cascadia Code',Menlo,Consolas,monospace" font-size="12">
+  <defs>
+    <linearGradient id="mbg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#161b22"/>
+    </linearGradient>
+    <linearGradient id="heap" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a2332"/>
+      <stop offset="100%" stop-color="#182030"/>
+    </linearGradient>
+    <linearGradient id="pool" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1c2a3a"/>
+      <stop offset="100%" stop-color="#1a2838"/>
+    </linearGradient>
+    <linearGradient id="slab" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2a1f2a"/>
+      <stop offset="100%" stop-color="#302030"/>
+    </linearGradient>
+    <linearGradient id="tla" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1f2a1f"/>
+      <stop offset="100%" stop-color="#243024"/>
+    </linearGradient>
+    <linearGradient id="block" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2a2520"/>
+      <stop offset="100%" stop-color="#302a24"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="600" height="560" rx="12" fill="url(#mbg)"/>
+
+  <!-- Heap container -->
+  <rect x="30" y="20" width="540" height="180" rx="8" fill="url(#heap)" stroke="#30363d" stroke-width="1"/>
+  <text x="300" y="44" text-anchor="middle" fill="#58a6ff" font-size="14" font-weight="700">Heap  (td_heap_t)</text>
+  <line x1="60" y1="52" x2="540" y2="52" stroke="#21262d" stroke-width="1"/>
+
+  <!-- Pools -->
+  <rect x="56" y="64" width="110" height="60" rx="6" fill="url(#pool)" stroke="#30363d" stroke-width="1"/>
+  <text x="111" y="84" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="600">Pool 0</text>
+  <text x="111" y="100" text-anchor="middle" fill="#8b949e" font-size="10">1 MB region</text>
+  <text x="111" y="114" text-anchor="middle" fill="#484f58" font-size="9">mmap'd</text>
+
+  <rect x="182" y="64" width="110" height="60" rx="6" fill="url(#pool)" stroke="#30363d" stroke-width="1"/>
+  <text x="237" y="84" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="600">Pool 1</text>
+  <text x="237" y="100" text-anchor="middle" fill="#8b949e" font-size="10">1 MB region</text>
+  <text x="237" y="114" text-anchor="middle" fill="#484f58" font-size="9">mmap'd</text>
+
+  <text x="326" y="94" text-anchor="middle" fill="#484f58" font-size="16">...</text>
+
+  <rect x="362" y="64" width="110" height="60" rx="6" fill="url(#pool)" stroke="#30363d" stroke-width="1"/>
+  <text x="417" y="84" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="600">Pool N</text>
+  <text x="417" y="100" text-anchor="middle" fill="#8b949e" font-size="10">1 MB region</text>
+  <text x="417" y="114" text-anchor="middle" fill="#484f58" font-size="9">mmap'd</text>
+
+  <!-- Free lists label -->
+  <text x="60" y="150" fill="#8b949e" font-size="11">Free lists:</text>
+  <g font-size="10">
+    <rect x="140" y="138" width="60" height="18" rx="3" fill="#21262d" stroke="#30363d" stroke-width="0.5"/>
+    <text x="170" y="151" text-anchor="middle" fill="#58a6ff">ord 6</text>
+    <rect x="208" y="138" width="60" height="18" rx="3" fill="#21262d" stroke="#30363d" stroke-width="0.5"/>
+    <text x="238" y="151" text-anchor="middle" fill="#58a6ff">ord 7</text>
+    <rect x="276" y="138" width="60" height="18" rx="3" fill="#21262d" stroke="#30363d" stroke-width="0.5"/>
+    <text x="306" y="151" text-anchor="middle" fill="#58a6ff">ord 8</text>
+    <text x="352" y="151" fill="#484f58">...</text>
+    <rect x="374" y="138" width="60" height="18" rx="3" fill="#21262d" stroke="#30363d" stroke-width="0.5"/>
+    <text x="404" y="151" text-anchor="middle" fill="#58a6ff">ord 30</text>
+  </g>
+  <text x="60" y="175" fill="#484f58" font-size="10">64 B                                                                                            1 GB</text>
+  <text x="60" y="190" fill="#484f58" font-size="10">Buddy split/coalesce on alloc/free</text>
+
+  <!-- Arrows down -->
+  <line x1="175" y1="200" x2="175" y2="230" stroke="#484f58" stroke-width="1.5"/>
+  <polygon points="175,236 170,228 180,228" fill="#484f58"/>
+  <line x1="420" y1="200" x2="420" y2="230" stroke="#484f58" stroke-width="1.5"/>
+  <polygon points="420,236 415,228 425,228" fill="#484f58"/>
+
+  <!-- Slab Cache -->
+  <rect x="40" y="240" width="230" height="130" rx="8" fill="url(#slab)" stroke="#30363d" stroke-width="1"/>
+  <text x="155" y="264" text-anchor="middle" fill="#d2a8ff" font-size="13" font-weight="700">Slab Cache</text>
+  <line x1="60" y1="272" x2="250" y2="272" stroke="#21262d" stroke-width="1"/>
+  <g fill="#c9d1d9" font-size="11">
+    <text x="60" y="292">Orders 0..4</text>
+    <text x="60" y="312">Fast path ~90% of allocs</text>
+    <text x="60" y="332">Object size 32..512 B</text>
+    <text x="60" y="352">Per-CPU free lists</text>
+  </g>
+
+  <!-- Thread-Local Arena -->
+  <rect x="300" y="240" width="260" height="130" rx="8" fill="url(#tla)" stroke="#30363d" stroke-width="1"/>
+  <text x="430" y="264" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="700">Thread-Local Arena</text>
+  <line x1="320" y1="272" x2="540" y2="272" stroke="#21262d" stroke-width="1"/>
+  <g fill="#c9d1d9" font-size="11">
+    <text x="320" y="292">Lock-free alloc (no contention)</text>
+    <text x="320" y="312">Foreign-block deferred free</text>
+    <text x="320" y="332">Cross-thread reclaim on flush</text>
+    <text x="320" y="352">COW: td_retain / td_release</text>
+  </g>
+
+  <!-- td_t block layout -->
+  <text x="300" y="408" text-anchor="middle" fill="#8b949e" font-size="13" font-weight="600">td_t  block layout  (32 bytes, 32-byte aligned)</text>
+
+  <!-- Block diagram -->
+  <g transform="translate(60, 420)">
+    <!-- Row 1: nullmap -->
+    <rect x="0" y="0" width="480" height="30" rx="4" fill="url(#block)" stroke="#f0883e" stroke-width="1"/>
+    <text x="240" y="20" text-anchor="middle" fill="#f0883e" font-size="11" font-weight="600">nullmap / slice_parent / ext_nullmap</text>
+    <text x="492" y="20" fill="#484f58" font-size="10">16 B</text>
+
+    <!-- Row 2: metadata -->
+    <rect x="0" y="36" width="72" height="30" rx="4" fill="url(#block)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="36" y="56" text-anchor="middle" fill="#58a6ff" font-size="10">mmod</text>
+
+    <rect x="78" y="36" width="72" height="30" rx="4" fill="url(#block)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="114" y="56" text-anchor="middle" fill="#58a6ff" font-size="10">order</text>
+
+    <rect x="156" y="36" width="72" height="30" rx="4" fill="url(#block)" stroke="#3fb950" stroke-width="1"/>
+    <text x="192" y="56" text-anchor="middle" fill="#3fb950" font-size="10">type</text>
+
+    <rect x="234" y="36" width="72" height="30" rx="4" fill="url(#block)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="270" y="56" text-anchor="middle" fill="#58a6ff" font-size="10">attrs</text>
+
+    <rect x="312" y="36" width="168" height="30" rx="4" fill="url(#block)" stroke="#d2a8ff" stroke-width="1"/>
+    <text x="396" y="56" text-anchor="middle" fill="#d2a8ff" font-size="10">rc  (atomic u32)</text>
+
+    <text x="492" y="56" fill="#484f58" font-size="10">8 B</text>
+
+    <!-- Row 3: value -->
+    <rect x="0" y="72" width="480" height="30" rx="4" fill="url(#block)" stroke="#f0883e" stroke-width="1"/>
+    <text x="240" y="92" text-anchor="middle" fill="#f0883e" font-size="11" font-weight="600">value: i64 / f64 / len / sso_string / obj*</text>
+    <text x="492" y="92" fill="#484f58" font-size="10">8 B</text>
+
+    <!-- Row 4: data -->
+    <rect x="0" y="108" width="480" height="30" rx="4" fill="#1a2332" stroke="#484f58" stroke-width="1" stroke-dasharray="4,3"/>
+    <text x="240" y="128" text-anchor="middle" fill="#8b949e" font-size="11">data[]  (flexible array member, 2^order - 32 bytes)</text>
+  </g>
+</svg>
