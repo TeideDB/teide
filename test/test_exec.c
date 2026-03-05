@@ -25,6 +25,7 @@
 #include <teide/td.h>
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
 
 /* Helper: create table with id1(I64), v1(I64), v3(F64) — 10 rows */
 static td_t* make_exec_table(void) {
@@ -1769,6 +1770,346 @@ static MunitResult test_exec_asof_empty(const void* params, void* data) {
     return MUNIT_OK;
 }
 
+/* ---- STRING HELPER ---- */
+static td_t* make_sym_table(void) {
+    td_sym_init();
+    int64_t s0 = td_sym_intern("hello", 5);
+    int64_t s1 = td_sym_intern("WORLD", 5);
+    int64_t s2 = td_sym_intern("  foo  ", 7);
+    int64_t s3 = td_sym_intern("bar_baz", 7);
+    int64_t s4 = td_sym_intern("", 0);
+    td_t *vec = td_vec_new(TD_SYM, 5);
+    vec->len = 5;
+    int64_t *data = (int64_t*)td_data(vec);
+    data[0]=s0; data[1]=s1; data[2]=s2; data[3]=s3; data[4]=s4;
+    int64_t n = td_sym_intern("name", 4);
+    td_t *tbl = td_table_new(1);
+    tbl = td_table_add_col(tbl, n, vec);
+    td_release(vec);
+    return tbl;
+}
+
+/* ---- UPPER ---- */
+static MunitResult test_exec_upper(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_t* tbl = make_sym_table();
+    td_graph_t* g = td_graph_new(tbl);
+
+    td_op_t* name_col = td_scan(g, "name");
+    td_op_t* up = td_upper(g, name_col);
+
+    td_t* result = td_execute(g, up);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->len, ==, 5);
+
+    int64_t *rdata = (int64_t*)td_data(result);
+    td_t* s = td_sym_str(rdata[0]);
+    munit_assert_string_equal(td_str_ptr(s), "HELLO");
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* ---- LOWER ---- */
+static MunitResult test_exec_lower(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_t* tbl = make_sym_table();
+    td_graph_t* g = td_graph_new(tbl);
+
+    td_op_t* name_col = td_scan(g, "name");
+    td_op_t* lo = td_lower(g, name_col);
+
+    td_t* result = td_execute(g, lo);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->len, ==, 5);
+
+    int64_t *rdata = (int64_t*)td_data(result);
+    td_t* s = td_sym_str(rdata[1]);
+    munit_assert_string_equal(td_str_ptr(s), "world");
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* ---- STRLEN ---- */
+static MunitResult test_exec_strlen(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_t* tbl = make_sym_table();
+    td_graph_t* g = td_graph_new(tbl);
+
+    td_op_t* name_col = td_scan(g, "name");
+    td_op_t* slen = td_strlen(g, name_col);
+
+    td_t* result = td_execute(g, slen);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->len, ==, 5);
+
+    int64_t *rdata = (int64_t*)td_data(result);
+    munit_assert_int(rdata[0], ==, 5);   /* "hello" */
+    munit_assert_int(rdata[1], ==, 5);   /* "WORLD" */
+    munit_assert_int(rdata[2], ==, 7);   /* "  foo  " */
+    munit_assert_int(rdata[3], ==, 7);   /* "bar_baz" */
+    munit_assert_int(rdata[4], ==, 0);   /* "" */
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* ---- TRIM ---- */
+static MunitResult test_exec_trim(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_t* tbl = make_sym_table();
+    td_graph_t* g = td_graph_new(tbl);
+
+    td_op_t* name_col = td_scan(g, "name");
+    td_op_t* tr = td_trim_op(g, name_col);
+
+    td_t* result = td_execute(g, tr);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->len, ==, 5);
+
+    int64_t *rdata = (int64_t*)td_data(result);
+    td_t* s = td_sym_str(rdata[2]);
+    munit_assert_string_equal(td_str_ptr(s), "foo");
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* ---- LIKE ---- */
+static MunitResult test_exec_like(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_t* tbl = make_sym_table();
+    td_graph_t* g = td_graph_new(tbl);
+
+    td_op_t* name_col = td_scan(g, "name");
+    td_op_t* pat = td_const_str(g, "bar%");
+    td_op_t* lk = td_like(g, name_col, pat);
+    td_op_t* cnt = td_count(g, td_filter(g, name_col, lk));
+
+    td_t* result = td_execute(g, cnt);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->i64, ==, 1);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* ---- CONCAT ---- */
+static MunitResult test_exec_concat(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    /* Build table with 3 SYM columns: a="hello", b=" ", c="world" */
+    int64_t s_hello = td_sym_intern("hello", 5);
+    int64_t s_space = td_sym_intern(" ", 1);
+    int64_t s_world = td_sym_intern("world", 5);
+
+    td_t* a_vec = td_vec_new(TD_SYM, 1);
+    a_vec->len = 1;
+    ((int64_t*)td_data(a_vec))[0] = s_hello;
+
+    td_t* b_vec = td_vec_new(TD_SYM, 1);
+    b_vec->len = 1;
+    ((int64_t*)td_data(b_vec))[0] = s_space;
+
+    td_t* c_vec = td_vec_new(TD_SYM, 1);
+    c_vec->len = 1;
+    ((int64_t*)td_data(c_vec))[0] = s_world;
+
+    int64_t na = td_sym_intern("a", 1);
+    int64_t nb = td_sym_intern("b", 1);
+    int64_t nc = td_sym_intern("c", 1);
+
+    td_t* tbl = td_table_new(3);
+    tbl = td_table_add_col(tbl, na, a_vec);
+    tbl = td_table_add_col(tbl, nb, b_vec);
+    tbl = td_table_add_col(tbl, nc, c_vec);
+    td_release(a_vec); td_release(b_vec); td_release(c_vec);
+
+    td_graph_t* g = td_graph_new(tbl);
+    td_op_t* oa = td_scan(g, "a");
+    td_op_t* ob = td_scan(g, "b");
+    td_op_t* oc = td_scan(g, "c");
+    td_op_t* args[] = {oa, ob, oc};
+    td_op_t* cat = td_concat(g, args, 3);
+
+    td_t* result = td_execute(g, cat);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->len, ==, 1);
+
+    int64_t *rdata = (int64_t*)td_data(result);
+    td_t* s = td_sym_str(rdata[0]);
+    munit_assert_string_equal(td_str_ptr(s), "hello world");
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* ---- EXTRACT ---- */
+static MunitResult test_exec_extract(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    /* 2024-06-15 12:30:45 UTC as microseconds since 2000-01-01 */
+    int64_t ts = 771769845000000LL;
+    td_t* ts_vec = td_vec_from_raw(TD_TIMESTAMP, &ts, 1);
+
+    int64_t n_ts = td_sym_intern("ts", 2);
+    td_t* tbl = td_table_new(1);
+    tbl = td_table_add_col(tbl, n_ts, ts_vec);
+    td_release(ts_vec);
+
+    /* YEAR */
+    td_graph_t* g = td_graph_new(tbl);
+    td_op_t* col = td_scan(g, "ts");
+    td_op_t* yr = td_extract(g, col, TD_EXTRACT_YEAR);
+    td_t* result = td_execute(g, yr);
+    munit_assert_false(TD_IS_ERR(result));
+    int64_t *rdata = (int64_t*)td_data(result);
+    munit_assert_int(rdata[0], ==, 2024);
+    td_release(result);
+    td_graph_free(g);
+
+    /* MONTH */
+    g = td_graph_new(tbl);
+    col = td_scan(g, "ts");
+    td_op_t* mo = td_extract(g, col, TD_EXTRACT_MONTH);
+    result = td_execute(g, mo);
+    munit_assert_false(TD_IS_ERR(result));
+    rdata = (int64_t*)td_data(result);
+    munit_assert_int(rdata[0], ==, 6);
+    td_release(result);
+    td_graph_free(g);
+
+    /* DAY */
+    g = td_graph_new(tbl);
+    col = td_scan(g, "ts");
+    td_op_t* dy = td_extract(g, col, TD_EXTRACT_DAY);
+    result = td_execute(g, dy);
+    munit_assert_false(TD_IS_ERR(result));
+    rdata = (int64_t*)td_data(result);
+    munit_assert_int(rdata[0], ==, 15);
+    td_release(result);
+    td_graph_free(g);
+
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* ---- DATE_TRUNC ---- */
+static MunitResult test_exec_date_trunc(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    int64_t ts = 771769845000000LL;
+    td_t* ts_vec = td_vec_from_raw(TD_TIMESTAMP, &ts, 1);
+
+    int64_t n_ts = td_sym_intern("ts", 2);
+    td_t* tbl = td_table_new(1);
+    tbl = td_table_add_col(tbl, n_ts, ts_vec);
+    td_release(ts_vec);
+
+    td_graph_t* g = td_graph_new(tbl);
+    td_op_t* col = td_scan(g, "ts");
+    td_op_t* trunc = td_date_trunc(g, col, TD_EXTRACT_MONTH);
+
+    td_t* result = td_execute(g, trunc);
+    munit_assert_false(TD_IS_ERR(result));
+    int64_t *rdata = (int64_t*)td_data(result);
+    munit_assert_true(rdata[0] < ts);
+    munit_assert_true(rdata[0] > 0);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* ---- CAST ---- */
+static MunitResult test_exec_cast(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_t* tbl = make_exec_table();
+    td_graph_t* g = td_graph_new(tbl);
+
+    td_op_t* v1 = td_scan(g, "v1");
+    td_op_t* casted = td_cast(g, v1, TD_F64);
+    td_op_t* s = td_sum(g, casted);
+
+    td_t* result = td_execute(g, s);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_double_equal(result->f64, 550.0, 6);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/* ---- GRAPH DUMP (smoke test) ---- */
+static MunitResult test_graph_dump(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_t *tbl = make_exec_table();
+    td_graph_t *g = td_graph_new(tbl);
+    td_op_t *v1 = td_scan(g, "v1");
+    td_op_t *id1 = td_scan(g, "id1");
+    td_op_t *pred = td_eq(g, id1, td_const_i64(g, 1));
+    td_op_t *filtered = td_filter(g, v1, pred);
+    td_op_t *s = td_sum(g, filtered);
+    td_op_t *opt = td_optimize(g, s);
+    /* Dump to /dev/null — just verify no crash */
+    FILE *devnull = fopen("/dev/null", "w");
+    if (devnull) { td_graph_dump(g, opt, devnull); fclose(devnull); }
+    td_t *result = td_execute(g, opt);
+    munit_assert_false(TD_IS_ERR(result));
+    td_release(result);
+    td_graph_free(g);
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
 /* ======================================================================
  * Suite
  * ====================================================================== */
@@ -1804,6 +2145,16 @@ static MunitTest exec_tests[] = {
     { "/asof_join",      test_exec_asof_join,      NULL, NULL, 0, NULL },
     { "/asof_left_join", test_exec_asof_left_join,  NULL, NULL, 0, NULL },
     { "/asof_empty",     test_exec_asof_empty,      NULL, NULL, 0, NULL },
+    { "/upper",          test_exec_upper,             NULL, NULL, 0, NULL },
+    { "/lower",          test_exec_lower,             NULL, NULL, 0, NULL },
+    { "/strlen",         test_exec_strlen,            NULL, NULL, 0, NULL },
+    { "/trim",           test_exec_trim,              NULL, NULL, 0, NULL },
+    { "/like",           test_exec_like,              NULL, NULL, 0, NULL },
+    { "/concat",         test_exec_concat,            NULL, NULL, 0, NULL },
+    { "/extract",        test_exec_extract,           NULL, NULL, 0, NULL },
+    { "/date_trunc",     test_exec_date_trunc,        NULL, NULL, 0, NULL },
+    { "/cast",           test_exec_cast,              NULL, NULL, 0, NULL },
+    { "/graph_dump",     test_graph_dump,             NULL, NULL, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL }
 };
 
