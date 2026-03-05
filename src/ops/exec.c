@@ -7539,6 +7539,7 @@ typedef struct {
     uint32_t*           offsets;     /* [n_workers][n_parts] per-worker write positions */
     int64_t             nrows;
     uint32_t            n_workers;
+    _Atomic(uint8_t)    had_error;   /* set by any worker on OOM */
 } join_radix_scatter_ctx_t;
 
 static void join_radix_scatter_fn(void* raw, uint32_t wid, int64_t task_start, int64_t task_end) {
@@ -7564,7 +7565,10 @@ static void join_radix_scatter_fn(void* raw, uint32_t wid, int64_t task_start, i
     td_t* wcb_cnt_hdr = NULL;
     if (n_parts > 1024) {
         wcb_cnt_p = (uint32_t*)scratch_calloc(&wcb_cnt_hdr, (size_t)n_parts * sizeof(uint32_t));
-        if (!wcb_cnt_p) return;
+        if (!wcb_cnt_p) {
+            atomic_store_explicit(&c->had_error, 1, memory_order_relaxed);
+            return;
+        }
     } else {
         memset(wcb_cnt_stack, 0, (size_t)n_parts * sizeof(uint32_t));
     }
@@ -7718,6 +7722,7 @@ static join_radix_part_t* join_radix_partition(td_pool_t* pool, int64_t nrows,
         .n_parts = n_parts, .parts = parts,
         .offsets = offsets,
         .nrows = nrows, .n_workers = n_workers,
+        .had_error = 0,
     };
     if (pool && nrows > TD_PARALLEL_THRESHOLD)
         td_pool_dispatch_n(pool, join_radix_scatter_fn, &sctx, n_workers);
@@ -7726,6 +7731,15 @@ static join_radix_part_t* join_radix_partition(td_pool_t* pool, int64_t nrows,
 
     scratch_free(off_hdr);
     scratch_free(hist_hdr);
+
+    if (atomic_load_explicit(&sctx.had_error, memory_order_relaxed)) {
+        for (uint32_t p = 0; p < n_parts; p++)
+            if (parts[p].entries_hdr) scratch_free(parts[p].entries_hdr);
+        scratch_free(parts_hdr);
+        *parts_hdr_out = NULL;
+        return NULL;
+    }
+
     return parts;
 }
 
@@ -8203,6 +8217,11 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
             join_radix_hash_fn(&lhctx, 0, 0, left_rows);
         }
 
+        if (pool_cancelled(pool)) {
+            scratch_free(r_hash_hdr); scratch_free(l_hash_hdr);
+            return TD_ERR_PTR(TD_ERR_CANCEL);
+        }
+
         /* Partition both sides using cached hashes */
         td_t* r_parts_hdr = NULL;
         join_radix_part_t* r_parts = join_radix_partition(pool, right_rows,
@@ -8225,6 +8244,15 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
                 scratch_free(l_parts_hdr);
             }
             goto chained_ht_fallback;
+        }
+
+        if (pool_cancelled(pool)) {
+            for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++) {
+                if (r_parts[rp2].entries_hdr) scratch_free(r_parts[rp2].entries_hdr);
+                if (l_parts[rp2].entries_hdr) scratch_free(l_parts[rp2].entries_hdr);
+            }
+            scratch_free(r_parts_hdr); scratch_free(l_parts_hdr);
+            return TD_ERR_PTR(TD_ERR_CANCEL);
         }
 
         /* FULL OUTER: allocate matched_right tracker */
@@ -8284,9 +8312,11 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
             for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++)
                 join_radix_build_probe_fn(&bp_ctx, 0, rp2, rp2 + 1);
 
-        /* Check for errors during build+probe (OOM, overflow) */
-        if (atomic_load_explicit(&bp_ctx.had_error, memory_order_relaxed)) {
-            /* Free all per-partition buffers and fall back to chained HT */
+        /* Check cancellation and errors during build+probe */
+        bool bp_cancelled = pool_cancelled(pool);
+        bool bp_error = atomic_load_explicit(&bp_ctx.had_error, memory_order_relaxed);
+        if (bp_cancelled || bp_error) {
+            /* Free all per-partition buffers */
             for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++) {
                 if (r_parts[rp2].entries_hdr) scratch_free(r_parts[rp2].entries_hdr);
                 if (l_parts[rp2].entries_hdr) scratch_free(l_parts[rp2].entries_hdr);
@@ -8297,6 +8327,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
             scratch_free(pp_meta_hdr); scratch_free(pcounts_hdr);
             if (matched_right_hdr) { scratch_free(matched_right_hdr); matched_right_hdr = NULL; }
             matched_right = NULL;
+            if (bp_cancelled) return TD_ERR_PTR(TD_ERR_CANCEL);
             goto chained_ht_fallback;
         }
 
