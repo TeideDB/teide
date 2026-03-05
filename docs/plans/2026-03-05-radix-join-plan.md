@@ -12,7 +12,7 @@
 
 ## Progress
 
-- [ ] Task 1: Add radix join constants to td.h
+- [x] Task 1: Add radix join constants to td.h
 - [ ] Task 2: Implement radix bit selection and partition count/scatter infrastructure
 - [ ] Task 3: Implement per-partition open-addressing build + probe
 - [ ] Task 4: Wire radix join into exec_join

@@ -190,6 +190,11 @@ extern "C" {
 #define TD_PARALLEL_THRESHOLD  (64 * TD_MORSEL_ELEMS)
 #define TD_DISPATCH_MORSELS    8
 
+/* Radix-partitioned hash join tuning */
+#define TD_JOIN_L2_TARGET   (256 * 1024)   /* target partition size in bytes  */
+#define TD_JOIN_MIN_RADIX   2              /* min radix bits (4 partitions)   */
+#define TD_JOIN_MAX_RADIX   14             /* max radix bits (16K partitions) */
+
 /* ===== Error Handling ===== */
 
 typedef enum {
