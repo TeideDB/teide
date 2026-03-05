@@ -78,6 +78,19 @@ if(TEIDE_FUZZ)
     endforeach()
 endif()
 
+# Benchmark targets
+option(TEIDE_BENCH "Build benchmark executables" OFF)
+if(TEIDE_BENCH)
+    file(GLOB BENCH_SOURCES CONFIGURE_DEPENDS "bench/*.c")
+    foreach(bench_src ${BENCH_SOURCES})
+        get_filename_component(bench_name ${bench_src} NAME_WE)
+        add_executable(${bench_name} ${bench_src})
+        target_link_libraries(${bench_name} PRIVATE teide_static)
+        target_include_directories(${bench_name} PRIVATE include src)
+        target_compile_options(${bench_name} PRIVATE ${TEIDE_RELEASE_FLAGS})
+    endforeach()
+endif()
+
 # Test executable
 enable_testing()
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "test/*.c")
