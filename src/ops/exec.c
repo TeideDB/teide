@@ -7996,15 +7996,9 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
             r_key_vecs[k] = rk->literal;
     }
 
-    /* Phase 1: Build hash table on right side (parallel with atomic CAS) */
     td_pool_t* pool = td_pool_get();
 
-    uint64_t ht_cap64 = 256;
-    uint64_t target = (uint64_t)right_rows * 2;
-    while (ht_cap64 < target) ht_cap64 *= 2;
-    if (ht_cap64 > UINT32_MAX) ht_cap64 = (uint64_t)1 << 31;
-    uint32_t ht_cap = (uint32_t)ht_cap64;
-
+    /* Shared output state — used by both radix and chained HT paths */
     td_t* result = NULL;
     td_t* counts_hdr = NULL;
     td_t* l_idx_hdr = NULL;
@@ -8012,8 +8006,197 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
     td_t* matched_right_hdr = NULL;
     td_t* sjoin_sel = NULL;
     td_t* asp_sel = NULL;
-    td_t* ht_next_hdr;
-    td_t* ht_heads_hdr;
+    td_t* ht_next_hdr = NULL;
+    td_t* ht_heads_hdr = NULL;
+    int64_t* l_idx = NULL;
+    int64_t* r_idx = NULL;
+    int64_t pair_count = 0;
+    _Atomic(uint8_t)* matched_right = NULL;
+
+    /* ── Radix-partitioned path (large joins) ──────────────────────── */
+    if (right_rows > TD_PARALLEL_THRESHOLD) {
+        uint8_t radix_bits = radix_join_bits(right_rows, n_keys);
+        uint32_t n_rparts = (uint32_t)1 << radix_bits;
+
+        /* Partition both sides */
+        td_t* r_parts_hdr = NULL;
+        join_radix_part_t* r_parts = join_radix_partition(pool, r_key_vecs, n_keys,
+                                                          right_rows, radix_bits, &r_parts_hdr);
+        td_t* l_parts_hdr = NULL;
+        join_radix_part_t* l_parts = join_radix_partition(pool, l_key_vecs, n_keys,
+                                                          left_rows, radix_bits, &l_parts_hdr);
+        if (!r_parts || !l_parts) {
+            /* OOM during partitioning — fall through to chained HT path */
+            if (r_parts) {
+                for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++)
+                    if (r_parts[rp2].entries_hdr) scratch_free(r_parts[rp2].entries_hdr);
+                scratch_free(r_parts_hdr);
+            }
+            if (l_parts) {
+                for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++)
+                    if (l_parts[rp2].entries_hdr) scratch_free(l_parts[rp2].entries_hdr);
+                scratch_free(l_parts_hdr);
+            }
+            goto chained_ht_fallback;
+        }
+
+        /* FULL OUTER: allocate matched_right tracker */
+        if (join_type == 2 && right_rows > 0) {
+            matched_right = (_Atomic(uint8_t)*)scratch_calloc(&matched_right_hdr,
+                                                               (size_t)right_rows);
+            if (!matched_right) {
+                for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++) {
+                    if (r_parts[rp2].entries_hdr) scratch_free(r_parts[rp2].entries_hdr);
+                    if (l_parts[rp2].entries_hdr) scratch_free(l_parts[rp2].entries_hdr);
+                }
+                scratch_free(r_parts_hdr); scratch_free(l_parts_hdr);
+                matched_right_hdr = NULL;
+                goto chained_ht_fallback;
+            }
+        }
+
+        /* Per-partition build+probe — count pass */
+        td_t* pcounts_hdr = NULL;
+        int64_t* part_counts = (int64_t*)scratch_calloc(&pcounts_hdr,
+                                  (size_t)n_rparts * sizeof(int64_t));
+        if (!part_counts) {
+            for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++) {
+                if (r_parts[rp2].entries_hdr) scratch_free(r_parts[rp2].entries_hdr);
+                if (l_parts[rp2].entries_hdr) scratch_free(l_parts[rp2].entries_hdr);
+            }
+            scratch_free(r_parts_hdr); scratch_free(l_parts_hdr);
+            if (matched_right_hdr) { scratch_free(matched_right_hdr); matched_right_hdr = NULL; }
+            matched_right = NULL;
+            goto chained_ht_fallback;
+        }
+
+        join_radix_bp_ctx_t bp_ctx = {
+            .l_parts = l_parts, .r_parts = r_parts,
+            .l_key_vecs = l_key_vecs, .r_key_vecs = r_key_vecs,
+            .n_keys = n_keys, .join_type = join_type,
+            .part_counts = part_counts,
+            .matched_right = matched_right,
+            .phase = 0,
+        };
+        if (pool && n_rparts > 1)
+            td_pool_dispatch_n(pool, join_radix_build_probe_fn, &bp_ctx, n_rparts);
+        else
+            for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++)
+                join_radix_build_probe_fn(&bp_ctx, 0, rp2, rp2 + 1);
+
+        /* Prefix sum → partition offsets */
+        td_t* poff_hdr = NULL;
+        int64_t* part_offsets = (int64_t*)scratch_alloc(&poff_hdr,
+                                  (size_t)n_rparts * sizeof(int64_t));
+        if (!part_offsets) {
+            for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++) {
+                if (r_parts[rp2].entries_hdr) scratch_free(r_parts[rp2].entries_hdr);
+                if (l_parts[rp2].entries_hdr) scratch_free(l_parts[rp2].entries_hdr);
+            }
+            scratch_free(r_parts_hdr); scratch_free(l_parts_hdr);
+            scratch_free(pcounts_hdr);
+            if (matched_right_hdr) scratch_free(matched_right_hdr);
+            matched_right_hdr = NULL;
+            return TD_ERR_PTR(TD_ERR_OOM);
+        }
+        for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++) {
+            part_offsets[rp2] = pair_count;
+            pair_count += part_counts[rp2];
+        }
+
+        /* Allocate output pair arrays */
+        if (pair_count > 0) {
+            l_idx = (int64_t*)scratch_alloc(&l_idx_hdr, (size_t)pair_count * sizeof(int64_t));
+            r_idx = (int64_t*)scratch_alloc(&r_idx_hdr, (size_t)pair_count * sizeof(int64_t));
+            if (!l_idx || !r_idx) {
+                scratch_free(l_idx_hdr); scratch_free(r_idx_hdr);
+                l_idx_hdr = NULL; r_idx_hdr = NULL;
+                for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++) {
+                    if (r_parts[rp2].entries_hdr) scratch_free(r_parts[rp2].entries_hdr);
+                    if (l_parts[rp2].entries_hdr) scratch_free(l_parts[rp2].entries_hdr);
+                }
+                scratch_free(r_parts_hdr); scratch_free(l_parts_hdr);
+                scratch_free(pcounts_hdr); scratch_free(poff_hdr);
+                if (matched_right_hdr) scratch_free(matched_right_hdr);
+                matched_right_hdr = NULL;
+                return TD_ERR_PTR(TD_ERR_OOM);
+            }
+        }
+
+        /* Fill pass */
+        bp_ctx.phase = 1;
+        bp_ctx.l_idx = l_idx;
+        bp_ctx.r_idx = r_idx;
+        bp_ctx.part_offsets = part_offsets;
+        if (pair_count > 0) {
+            if (pool && n_rparts > 1)
+                td_pool_dispatch_n(pool, join_radix_build_probe_fn, &bp_ctx, n_rparts);
+            else
+                for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++)
+                    join_radix_build_probe_fn(&bp_ctx, 0, rp2, rp2 + 1);
+        }
+
+        /* Free partition buffers — no longer needed */
+        for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++) {
+            if (r_parts[rp2].entries_hdr) scratch_free(r_parts[rp2].entries_hdr);
+            if (l_parts[rp2].entries_hdr) scratch_free(l_parts[rp2].entries_hdr);
+        }
+        scratch_free(r_parts_hdr);
+        scratch_free(l_parts_hdr);
+        scratch_free(pcounts_hdr);
+        scratch_free(poff_hdr);
+
+        /* FULL OUTER: append unmatched right rows */
+        if (join_type == 2 && matched_right) {
+            int64_t unmatched_right = 0;
+            for (int64_t r = 0; r < right_rows; r++)
+                if (!matched_right[r]) unmatched_right++;
+
+            if (unmatched_right > 0) {
+                int64_t total = pair_count + unmatched_right;
+                td_t* new_l_hdr; td_t* new_r_hdr;
+                int64_t* new_l = (int64_t*)scratch_alloc(&new_l_hdr,
+                                    (size_t)total * sizeof(int64_t));
+                int64_t* new_r = (int64_t*)scratch_alloc(&new_r_hdr,
+                                    (size_t)total * sizeof(int64_t));
+                if (!new_l || !new_r) {
+                    scratch_free(new_l_hdr); scratch_free(new_r_hdr);
+                    scratch_free(l_idx_hdr); scratch_free(r_idx_hdr);
+                    l_idx_hdr = NULL; r_idx_hdr = NULL;
+                    scratch_free(matched_right_hdr);
+                    matched_right_hdr = NULL;
+                    return TD_ERR_PTR(TD_ERR_OOM);
+                }
+                if (pair_count > 0) {
+                    memcpy(new_l, l_idx, (size_t)pair_count * sizeof(int64_t));
+                    memcpy(new_r, r_idx, (size_t)pair_count * sizeof(int64_t));
+                }
+                scratch_free(l_idx_hdr); scratch_free(r_idx_hdr);
+                int64_t off = pair_count;
+                for (int64_t r = 0; r < right_rows; r++) {
+                    if (!matched_right[r]) {
+                        new_l[off] = -1;
+                        new_r[off] = r;
+                        off++;
+                    }
+                }
+                l_idx = new_l; r_idx = new_r;
+                l_idx_hdr = new_l_hdr; r_idx_hdr = new_r_hdr;
+                pair_count = total;
+            }
+        }
+
+        goto join_gather;
+    }
+
+chained_ht_fallback:;
+    /* ── Chained HT path (small joins / radix OOM fallback) ────────── */
+    uint64_t ht_cap64 = 256;
+    uint64_t target = (uint64_t)right_rows * 2;
+    while (ht_cap64 < target) ht_cap64 *= 2;
+    if (ht_cap64 > UINT32_MAX) ht_cap64 = (uint64_t)1 << 31;
+    uint32_t ht_cap = (uint32_t)ht_cap64;
+
     uint32_t* ht_next = (uint32_t*)scratch_alloc(&ht_next_hdr, (size_t)right_rows * sizeof(uint32_t));
     // cppcheck-suppress internalAstError
     // Valid C11/C17 _Atomic(T)* declaration; cppcheck parser may mis-handle this syntax.
@@ -8113,7 +8296,6 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
     }
 
     /* For FULL OUTER JOIN, allocate matched_right tracker */
-    _Atomic(uint8_t)* matched_right = NULL;
     if (join_type == 2 && right_rows > 0) {
         matched_right = (_Atomic(uint8_t)*)scratch_calloc(&matched_right_hdr,
                                                            (size_t)right_rows);
@@ -8151,7 +8333,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
             join_count_fn(&probe_ctx, 0, t, t + 1);
 
     /* Prefix sum → morsel_offsets (reuse counts array as offsets) */
-    int64_t pair_count = 0;
+    pair_count = 0;
     for (uint32_t t = 0; t < n_tasks; t++) {
         int64_t cnt = morsel_counts[t];
         morsel_counts[t] = pair_count;
@@ -8159,9 +8341,6 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
     }
 
     /* Allocate output pair arrays */
-    int64_t* l_idx = NULL;
-    int64_t* r_idx = NULL;
-
     if (pair_count > 0) {
         l_idx = (int64_t*)scratch_alloc(&l_idx_hdr, (size_t)pair_count * sizeof(int64_t));
         r_idx = (int64_t*)scratch_alloc(&r_idx_hdr, (size_t)pair_count * sizeof(int64_t));
@@ -8221,6 +8400,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
         }
     }
 
+join_gather:;
     /* Phase 3: Build result table with parallel column gather.
      * Use multi_gather for batched column access when possible (non-nullable
      * indices), falling back to per-column gather for nullable RIGHT columns. */
@@ -8365,11 +8545,11 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
     }
 
 join_cleanup:
-    scratch_free(ht_next_hdr);
-    scratch_free(ht_heads_hdr);
+    if (ht_next_hdr) scratch_free(ht_next_hdr);
+    if (ht_heads_hdr) scratch_free(ht_heads_hdr);
     scratch_free(l_idx_hdr);
     scratch_free(r_idx_hdr);
-    scratch_free(counts_hdr);
+    if (counts_hdr) scratch_free(counts_hdr);
     scratch_free(matched_right_hdr);
     if (sjoin_sel) td_release(sjoin_sel);
     if (asp_sel) td_release(asp_sel);
