@@ -470,15 +470,12 @@ typedef struct td_op_ext {
             uint8_t    n_join_keys;
             uint8_t    join_type;  /* 0=inner, 1=left, 2=full */
         } join;
-        struct {               /* OP_WINDOW_JOIN: ASOF window join */
+        struct {               /* OP_WINDOW_JOIN: ASOF join */
             td_op_t*   time_key;      /* time/ordered key column */
-            td_op_t*   sym_key;       /* optional symbol key (NULL = no partition) */
-            int64_t    window_lo;     /* lower bound of time window */
-            int64_t    window_hi;     /* upper bound of time window */
-            uint16_t*  agg_ops;       /* aggregation opcodes */
-            td_op_t**  agg_inputs;    /* aggregation input columns */
-            uint8_t    n_aggs;        /* number of aggregations */
-        } wjoin;
+            td_op_t**  eq_keys;       /* equality partition keys */
+            uint8_t    n_eq_keys;     /* number of equality keys */
+            uint8_t    join_type;     /* 0=inner, 1=left outer */
+        } asof;
         struct {               /* OP_WINDOW: window functions */
             td_op_t**  part_keys;
             td_op_t**  order_keys;
@@ -849,12 +846,11 @@ td_op_t* td_join(td_graph_t* g,
                   td_op_t* left_table, td_op_t** left_keys,
                   td_op_t* right_table, td_op_t** right_keys,
                   uint8_t n_keys, uint8_t join_type);
-td_op_t* td_window_join(td_graph_t* g,
-                         td_op_t* left_table, td_op_t* right_table,
-                         td_op_t* time_key, td_op_t* sym_key,
-                         int64_t window_lo, int64_t window_hi,
-                         uint16_t* agg_ops, td_op_t** agg_ins,
-                         uint8_t n_aggs);
+td_op_t* td_asof_join(td_graph_t* g,
+                       td_op_t* left_table, td_op_t* right_table,
+                       td_op_t* time_key,
+                       td_op_t** eq_keys, uint8_t n_eq_keys,
+                       uint8_t join_type);
 td_op_t* td_window_op(td_graph_t* g, td_op_t* table_node,
                        td_op_t** part_keys, uint8_t n_part,
                        td_op_t** order_keys, uint8_t* order_descs, uint8_t n_order,
