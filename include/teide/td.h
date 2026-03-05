@@ -191,8 +191,7 @@ extern "C" {
 #define TD_DISPATCH_MORSELS    8
 
 /* Radix-partitioned hash join tuning.
- * L2_TARGET: per-partition HT working set limit.  Targets L1d cache
- * (192 KB on Apple Silicon P-cores, 32-64 KB on x86).                   */
+ * L2_TARGET: per-partition HT working set limit (tuned for L1d/L2).     */
 #define TD_JOIN_L2_TARGET   (256 * 1024)   /* target partition HT size in bytes */
 #define TD_JOIN_MIN_RADIX   2              /* min radix bits (4 partitions)   */
 #define TD_JOIN_MAX_RADIX   14             /* max radix bits (16K partitions) */

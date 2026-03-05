@@ -7451,9 +7451,8 @@ typedef struct {
     uint32_t            count;       /* number of entries in partition */
 } join_radix_part_t;
 
-/* Choose radix bits so each partition's working set fits in L2 cache.
- * Working set per partition = right entries (8B) + left entries (~8B)
- * + open-addressing HT (2x right entries × 8B) ≈ 32B per right row. */
+/* Choose radix bits so each partition's HT working set fits in cache.
+ * HT working set per partition ≈ 2x right entries × 8B = 16B per right row. */
 static uint8_t radix_join_bits(int64_t right_rows, uint8_t n_keys) {
     (void)n_keys;
     /* HT working set: 2x capacity × 8B slot = 16B per right row */
@@ -7778,6 +7777,7 @@ typedef struct {
     int64_t*       part_counts;  /* actual output count per partition */
     uint32_t*      pp_cap;       /* capacity per partition */
     _Atomic(uint8_t)* matched_right;
+    _Atomic(uint8_t)  had_error;  /* set by any partition on OOM */
 } join_radix_bp_ctx_t;
 
 static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_start, int64_t task_end) {
@@ -7828,11 +7828,25 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
     uint32_t ht_cap = 256;
     uint64_t ht_target = (uint64_t)rp->count * 2;
     while ((uint64_t)ht_cap < ht_target && ht_cap <= (UINT32_MAX >> 1)) ht_cap *= 2;
+    if ((uint64_t)ht_cap < ht_target) {
+        /* Partition too large for open-addressing HT — signal error */
+        atomic_store_explicit(&c->had_error, 1, memory_order_relaxed);
+        c->part_counts[p] = 0;
+        scratch_free(c->pp_l_hdr[p]); scratch_free(c->pp_r_hdr[p]);
+        c->pp_l_hdr[p] = NULL; c->pp_r_hdr[p] = NULL;
+        return;
+    }
     uint32_t ht_mask = ht_cap - 1;
 
     td_t* ht_hdr;
     uint32_t* ht = (uint32_t*)scratch_calloc(&ht_hdr, (size_t)ht_cap * 2 * sizeof(uint32_t));
-    if (!ht) { c->part_counts[p] = 0; return; }
+    if (!ht) {
+        atomic_store_explicit(&c->had_error, 1, memory_order_relaxed);
+        scratch_free(c->pp_l_hdr[p]); scratch_free(c->pp_r_hdr[p]);
+        c->pp_l_hdr[p] = NULL; c->pp_r_hdr[p] = NULL;
+        c->part_counts[p] = 0;
+        return;
+    }
     for (uint32_t s = 0; s < ht_cap; s++)
         ht[s * 2 + 1] = RADIX_HT_EMPTY;
 
@@ -7862,6 +7876,10 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
                                  (int64_t)lr, (int64_t)rr)) {
                     /* Grow buffer if needed */
                     if (cnt >= cap) {
+                        if (cap > UINT32_MAX / 2) {
+                            atomic_store_explicit(&c->had_error, 1, memory_order_relaxed);
+                            goto done;
+                        }
                         uint32_t new_cap = cap * 2;
                         td_t* nl_hdr; td_t* nr_hdr;
                         int32_t* nl = (int32_t*)scratch_alloc(&nl_hdr, (size_t)new_cap * sizeof(int32_t));
@@ -7869,6 +7887,7 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
                         if (!nl || !nr) {
                             if (nl_hdr) scratch_free(nl_hdr);
                             if (nr_hdr) scratch_free(nr_hdr);
+                            atomic_store_explicit(&c->had_error, 1, memory_order_relaxed);
                             goto done;
                         }
                         memcpy(nl, pl, (size_t)cnt * sizeof(int32_t));
@@ -7890,6 +7909,10 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
         }
         if (!matched && c->join_type >= 1) {
             if (cnt >= cap) {
+                if (cap > UINT32_MAX / 2) {
+                    atomic_store_explicit(&c->had_error, 1, memory_order_relaxed);
+                    goto done;
+                }
                 uint32_t new_cap = cap * 2;
                 td_t* nl_hdr; td_t* nr_hdr;
                 int32_t* nl = (int32_t*)scratch_alloc(&nl_hdr, (size_t)new_cap * sizeof(int32_t));
@@ -7897,6 +7920,7 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
                 if (!nl || !nr) {
                     if (nl_hdr) scratch_free(nl_hdr);
                     if (nr_hdr) scratch_free(nr_hdr);
+                    atomic_store_explicit(&c->had_error, 1, memory_order_relaxed);
                     goto done;
                 }
                 memcpy(nl, pl, (size_t)cnt * sizeof(int32_t));
@@ -8106,8 +8130,9 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
 
     int64_t left_rows = td_table_nrows(left_table);
     int64_t right_rows = td_table_nrows(right_table);
-    /* Guard: uint32_t row indices in HT chains / radix entries cannot represent >4B rows */
-    if (right_rows > (int64_t)(UINT32_MAX - 1) || left_rows > (int64_t)(UINT32_MAX - 1))
+    /* Guard: radix path stores row indices as int32_t (widened to int64_t on gather).
+     * Chained HT path uses uint32_t.  Cap at INT32_MAX for correctness. */
+    if (right_rows > (int64_t)INT32_MAX || left_rows > (int64_t)INT32_MAX)
         return TD_ERR_PTR(TD_ERR_NYI);
     uint8_t n_keys = ext->join.n_join_keys;
     uint8_t join_type = ext->join.join_type;
@@ -8251,6 +8276,22 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
         else
             for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++)
                 join_radix_build_probe_fn(&bp_ctx, 0, rp2, rp2 + 1);
+
+        /* Check for errors during build+probe (OOM, overflow) */
+        if (atomic_load_explicit(&bp_ctx.had_error, memory_order_relaxed)) {
+            /* Free all per-partition buffers and fall back to chained HT */
+            for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++) {
+                if (r_parts[rp2].entries_hdr) scratch_free(r_parts[rp2].entries_hdr);
+                if (l_parts[rp2].entries_hdr) scratch_free(l_parts[rp2].entries_hdr);
+                if (pp_l_hdr[rp2]) scratch_free(pp_l_hdr[rp2]);
+                if (pp_r_hdr[rp2]) scratch_free(pp_r_hdr[rp2]);
+            }
+            scratch_free(r_parts_hdr); scratch_free(l_parts_hdr);
+            scratch_free(pp_meta_hdr); scratch_free(pcounts_hdr);
+            if (matched_right_hdr) { scratch_free(matched_right_hdr); matched_right_hdr = NULL; }
+            matched_right = NULL;
+            goto chained_ht_fallback;
+        }
 
         /* Free partition buffers — no longer needed */
         for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++) {
