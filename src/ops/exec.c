@@ -8104,47 +8104,73 @@ static td_t* exec_window_join(td_graph_t* g, td_op_t* op,
     for (int64_t i = 0; i < left_n; i++) li_idx[i] = i;
     for (int64_t i = 0; i < right_n; i++) ri_idx[i] = i;
 
-    /* Insertion sort on left indices */
-    for (int64_t i = 1; i < left_n; i++) {
-        int64_t key = li_idx[i];
-        int64_t j = i - 1;
-        while (j >= 0) {
-            int64_t o = li_idx[j];
-            int cmp = 0;
-            for (uint8_t k = 0; k < n_eq && cmp == 0; k++) {
-                if (lt_eq[k][key] < lt_eq[k][o]) cmp = -1;
-                else if (lt_eq[k][key] > lt_eq[k][o]) cmp = 1;
-            }
-            if (cmp == 0) {
-                if (lt_time[key] < lt_time[o]) cmp = -1;
-                else if (lt_time[key] > lt_time[o]) cmp = 1;
-            }
-            if (cmp >= 0) break;
-            li_idx[j + 1] = li_idx[j];
-            j--;
+    /* Bottom-up mergesort on index arrays — O(N log N) */
+    {
+        int64_t max_n = left_n > right_n ? left_n : right_n;
+        td_t* tmp_hdr = NULL;
+        int64_t* tmp = max_n > 0
+            ? (int64_t*)scratch_alloc(&tmp_hdr, (size_t)max_n * sizeof(int64_t))
+            : NULL;
+        if (!tmp && max_n > 0) {
+            scratch_free(li_hdr); scratch_free(ri_hdr);
+            return TD_ERR_PTR(TD_ERR_OOM);
         }
-        li_idx[j + 1] = key;
-    }
-    /* Insertion sort on right indices */
-    for (int64_t i = 1; i < right_n; i++) {
-        int64_t key = ri_idx[i];
-        int64_t j = i - 1;
-        while (j >= 0) {
-            int64_t o = ri_idx[j];
-            int cmp = 0;
-            for (uint8_t k = 0; k < n_eq && cmp == 0; k++) {
-                if (rt_eq[k][key] < rt_eq[k][o]) cmp = -1;
-                else if (rt_eq[k][key] > rt_eq[k][o]) cmp = 1;
+
+        /* Sort left indices by (eq_keys, time) */
+        for (int64_t width = 1; width < left_n; width *= 2) {
+            for (int64_t lo = 0; lo < left_n; lo += 2 * width) {
+                int64_t mid = lo + width;
+                int64_t hi = lo + 2 * width;
+                if (mid > left_n) mid = left_n;
+                if (hi > left_n) hi = left_n;
+                int64_t a = lo, b = mid, t = lo;
+                while (a < mid && b < hi) {
+                    int64_t ai = li_idx[a], bi = li_idx[b];
+                    int cmp = 0;
+                    for (uint8_t k2 = 0; k2 < n_eq && cmp == 0; k2++) {
+                        if (lt_eq[k2][ai] < lt_eq[k2][bi]) cmp = -1;
+                        else if (lt_eq[k2][ai] > lt_eq[k2][bi]) cmp = 1;
+                    }
+                    if (cmp == 0) {
+                        if (lt_time[ai] < lt_time[bi]) cmp = -1;
+                        else if (lt_time[ai] > lt_time[bi]) cmp = 1;
+                    }
+                    tmp[t++] = (cmp <= 0) ? li_idx[a++] : li_idx[b++];
+                }
+                while (a < mid) tmp[t++] = li_idx[a++];
+                while (b < hi) tmp[t++] = li_idx[b++];
+                for (int64_t c = lo; c < hi; c++) li_idx[c] = tmp[c];
             }
-            if (cmp == 0) {
-                if (rt_time[key] < rt_time[o]) cmp = -1;
-                else if (rt_time[key] > rt_time[o]) cmp = 1;
-            }
-            if (cmp >= 0) break;
-            ri_idx[j + 1] = ri_idx[j];
-            j--;
         }
-        ri_idx[j + 1] = key;
+
+        /* Sort right indices by (eq_keys, time) */
+        for (int64_t width = 1; width < right_n; width *= 2) {
+            for (int64_t lo = 0; lo < right_n; lo += 2 * width) {
+                int64_t mid = lo + width;
+                int64_t hi = lo + 2 * width;
+                if (mid > right_n) mid = right_n;
+                if (hi > right_n) hi = right_n;
+                int64_t a = lo, b = mid, t = lo;
+                while (a < mid && b < hi) {
+                    int64_t ai = ri_idx[a], bi = ri_idx[b];
+                    int cmp = 0;
+                    for (uint8_t k2 = 0; k2 < n_eq && cmp == 0; k2++) {
+                        if (rt_eq[k2][ai] < rt_eq[k2][bi]) cmp = -1;
+                        else if (rt_eq[k2][ai] > rt_eq[k2][bi]) cmp = 1;
+                    }
+                    if (cmp == 0) {
+                        if (rt_time[ai] < rt_time[bi]) cmp = -1;
+                        else if (rt_time[ai] > rt_time[bi]) cmp = 1;
+                    }
+                    tmp[t++] = (cmp <= 0) ? ri_idx[a++] : ri_idx[b++];
+                }
+                while (a < mid) tmp[t++] = ri_idx[a++];
+                while (b < hi) tmp[t++] = ri_idx[b++];
+                for (int64_t c = lo; c < hi; c++) ri_idx[c] = tmp[c];
+            }
+        }
+
+        if (tmp_hdr) scratch_free(tmp_hdr);
     }
 
     /* Build match array: for each left row (sorted), find best right match */
