@@ -1,7 +1,14 @@
 #include <teide/td.h>
 #include <mem/sys.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
+#include <sys/utsname.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#else
+#include <unistd.h>
+#endif
 
 static double now_ns(void) {
     struct timespec ts;
@@ -144,9 +151,82 @@ static void bench_q2_relational(int64_t n) {
     td_heap_destroy();
 }
 
+static void print_machine_info(void) {
+    struct utsname u;
+    uname(&u);
+    printf("System:  %s %s %s\n", u.sysname, u.release, u.machine);
+
+#ifdef __APPLE__
+    /* CPU brand string */
+    char cpu[128] = "unknown";
+    size_t cpu_len = sizeof(cpu);
+    if (sysctlbyname("machdep.cpu.brand_string", cpu, &cpu_len, NULL, 0) != 0)
+        sysctlbyname("hw.model", cpu, &cpu_len, NULL, 0);
+    printf("CPU:     %s\n", cpu);
+
+    /* Physical + logical cores */
+    int pcores = 0, lcores = 0;
+    size_t sz = sizeof(int);
+    sysctlbyname("hw.physicalcpu", &pcores, &sz, NULL, 0);
+    sysctlbyname("hw.logicalcpu", &lcores, &sz, NULL, 0);
+    printf("Cores:   %d physical, %d logical\n", pcores, lcores);
+
+    /* RAM */
+    uint64_t mem = 0;
+    size_t msz = sizeof(mem);
+    sysctlbyname("hw.memsize", &mem, &msz, NULL, 0);
+    printf("Memory:  %llu GB\n", (unsigned long long)(mem / (1024ULL * 1024 * 1024)));
+
+    /* L1/L2/L3 cache sizes */
+    uint64_t l1d = 0, l2 = 0, l3 = 0;
+    size_t csz = sizeof(uint64_t);
+    sysctlbyname("hw.l1dcachesize", &l1d, &csz, NULL, 0);
+    sysctlbyname("hw.l2cachesize", &l2, &csz, NULL, 0);
+    sysctlbyname("hw.l3cachesize", &l3, &csz, NULL, 0);
+    if (l1d) printf("Cache:   L1d %llu KB", (unsigned long long)(l1d / 1024));
+    if (l2)  printf(", L2 %llu KB", (unsigned long long)(l2 / 1024));
+    if (l3)  printf(", L3 %llu MB", (unsigned long long)(l3 / (1024 * 1024)));
+    printf("\n");
+#else
+    /* Linux: read /proc */
+    FILE* f = fopen("/proc/cpuinfo", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "model name", 10) == 0) {
+                char* p = strchr(line, ':');
+                if (p) printf("CPU:     %s", p + 2);
+                break;
+            }
+        }
+        fclose(f);
+    }
+
+    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+    if (nproc > 0) printf("Cores:   %ld\n", nproc);
+
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_sz = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_sz > 0) {
+        uint64_t mem = (uint64_t)pages * (uint64_t)page_sz;
+        printf("Memory:  %llu GB\n", (unsigned long long)(mem / (1024ULL * 1024 * 1024)));
+    }
+#endif
+
+    /* Build type */
+#ifdef NDEBUG
+    printf("Build:   Release\n");
+#else
+    printf("Build:   Debug\n");
+#endif
+    printf("\n");
+}
+
 int main(void) {
     int64_t sizes[] = { 10000, 1000000 };
     int n_sizes = 2;
+
+    print_machine_info();
 
     printf("%-30s  %10s  %10s  %12s\n", "Query", "Rows", "Time", "Throughput");
     printf("%-30s  %10s  %10s  %12s\n",
