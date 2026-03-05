@@ -7429,6 +7429,206 @@ batch_fail:
 }
 
 /* ============================================================================
+ * Radix-partitioned hash join
+ *
+ * Four-phase pipeline:
+ *   Phase 1: Partition both sides by radix bits of hash (parallel)
+ *   Phase 2: Per-partition build + probe with open-addressing HT (parallel)
+ *   Phase 3: Gather output columns from matched pairs (parallel)
+ *   Phase 4: Fallback to chained HT for small joins (< TD_PARALLEL_THRESHOLD)
+ * ============================================================================ */
+
+/* Partition entry: row index + cached hash */
+typedef struct {
+    uint32_t row_idx;
+    uint32_t hash;
+} join_radix_entry_t;
+
+/* Per-partition descriptor */
+typedef struct {
+    join_radix_entry_t* entries;     /* partition buffer (from td_alloc) */
+    td_t*               entries_hdr; /* td_alloc header for freeing */
+    uint32_t            count;       /* number of entries in partition */
+} join_radix_part_t;
+
+/* Choose radix bits so each right-side partition fits in L2 cache */
+static uint8_t radix_join_bits(int64_t right_rows, uint8_t n_keys) {
+    (void)n_keys;
+    /* Estimate bytes per right-side entry: row_idx(4) + hash(4) = 8 */
+    size_t right_bytes = (size_t)right_rows * sizeof(join_radix_entry_t);
+    if (right_bytes <= TD_JOIN_L2_TARGET)
+        return TD_JOIN_MIN_RADIX;
+
+    /* R = ceil(log2(right_bytes / L2_TARGET)) */
+    uint8_t r = 0;
+    size_t target = TD_JOIN_L2_TARGET;
+    while (target < right_bytes && r < 63) {
+        target *= 2;
+        r++;
+    }
+    if (r < TD_JOIN_MIN_RADIX) r = TD_JOIN_MIN_RADIX;
+    if (r > TD_JOIN_MAX_RADIX) r = TD_JOIN_MAX_RADIX;
+    return r;
+}
+
+/* Context for parallel partition histogram */
+typedef struct {
+    td_t**    key_vecs;
+    uint8_t   n_keys;
+    uint32_t  radix_mask;   /* (1 << radix_bits) - 1 */
+    uint8_t   radix_shift;  /* hash bits to shift before masking */
+    uint32_t  n_parts;      /* 1 << radix_bits */
+    uint32_t  n_workers;
+    uint32_t* histograms;   /* [n_workers][n_parts] flat array */
+} join_radix_hist_ctx_t;
+
+static void join_radix_hist_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_radix_hist_ctx_t* c = (join_radix_hist_ctx_t*)raw;
+    uint32_t* hist = c->histograms + (uint32_t)wid * c->n_parts;
+    uint32_t mask = c->radix_mask;
+    uint8_t shift = c->radix_shift;
+
+    for (int64_t r = start; r < end; r++) {
+        uint64_t h = hash_row_keys(c->key_vecs, c->n_keys, r);
+        uint32_t part = (uint32_t)(h >> shift) & mask;
+        hist[part]++;
+    }
+}
+
+/* Context for parallel partition scatter */
+typedef struct {
+    td_t**              key_vecs;
+    uint8_t             n_keys;
+    uint32_t            radix_mask;
+    uint8_t             radix_shift;
+    uint32_t            n_parts;
+    join_radix_part_t*  parts;       /* partition descriptors */
+    uint32_t*           offsets;     /* [n_workers][n_parts] per-worker write positions */
+} join_radix_scatter_ctx_t;
+
+static void join_radix_scatter_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_radix_scatter_ctx_t* c = (join_radix_scatter_ctx_t*)raw;
+    uint32_t* off = c->offsets + (uint32_t)wid * c->n_parts;
+    uint32_t mask = c->radix_mask;
+    uint8_t shift = c->radix_shift;
+
+    for (int64_t r = start; r < end; r++) {
+        uint64_t h = hash_row_keys(c->key_vecs, c->n_keys, r);
+        uint32_t part = (uint32_t)(h >> shift) & mask;
+        uint32_t pos = off[part]++;
+        join_radix_entry_t* entries = c->parts[part].entries;
+        entries[pos].row_idx = (uint32_t)r;
+        entries[pos].hash = (uint32_t)h;  /* lower 32 bits for HT probe */
+    }
+}
+
+/* Partition one side of the join. Returns array of join_radix_part_t[n_parts].
+ * Caller must free each partition's entries_hdr and the parts array itself. */
+static join_radix_part_t* join_radix_partition(td_pool_t* pool, td_t** key_vecs,
+                                      uint8_t n_keys, int64_t nrows,
+                                      uint8_t radix_bits, td_t** parts_hdr_out) {
+    uint32_t n_parts = (uint32_t)1 << radix_bits;
+    uint32_t mask = n_parts - 1;
+    /* Use upper bits of hash for radix (lower bits used inside partition HT) */
+    uint8_t shift = 32 - radix_bits;
+
+    /* Allocate partition descriptor array */
+    td_t* parts_hdr;
+    join_radix_part_t* parts = (join_radix_part_t*)scratch_calloc(&parts_hdr,
+                            (size_t)n_parts * sizeof(join_radix_part_t));
+    if (!parts) { *parts_hdr_out = NULL; return NULL; }
+    *parts_hdr_out = parts_hdr;
+
+    /* Step 1: Histogram — count rows per partition per worker */
+    uint32_t n_workers = pool ? pool->n_workers + 1 : 1;  /* +1 for main thread */
+    td_t* hist_hdr;
+    uint32_t* histograms = (uint32_t*)scratch_calloc(&hist_hdr,
+                             (size_t)n_workers * n_parts * sizeof(uint32_t));
+    if (!histograms) { scratch_free(parts_hdr); *parts_hdr_out = NULL; return NULL; }
+
+    join_radix_hist_ctx_t hctx = {
+        .key_vecs = key_vecs, .n_keys = n_keys,
+        .radix_mask = mask, .radix_shift = shift,
+        .n_parts = n_parts, .n_workers = n_workers,
+        .histograms = histograms,
+    };
+    if (pool && nrows > TD_PARALLEL_THRESHOLD)
+        td_pool_dispatch(pool, join_radix_hist_fn, &hctx, nrows);
+    else
+        join_radix_hist_fn(&hctx, 0, 0, nrows);
+
+    /* Compute partition sizes (sum across workers) */
+    for (uint32_t p = 0; p < n_parts; p++) {
+        uint32_t total = 0;
+        for (uint32_t w = 0; w < n_workers; w++)
+            total += histograms[w * n_parts + p];
+        parts[p].count = total;
+    }
+
+    /* Allocate partition buffers */
+    bool oom = false;
+    for (uint32_t p = 0; p < n_parts; p++) {
+        if (parts[p].count == 0) continue;
+        parts[p].entries = (join_radix_entry_t*)scratch_alloc(&parts[p].entries_hdr,
+                             (size_t)parts[p].count * sizeof(join_radix_entry_t));
+        if (!parts[p].entries) {
+            /* OOM: try gc + release + retry once */
+            td_heap_gc();
+            td_heap_release_pages();
+            parts[p].entries = (join_radix_entry_t*)scratch_alloc(&parts[p].entries_hdr,
+                                 (size_t)parts[p].count * sizeof(join_radix_entry_t));
+            if (!parts[p].entries) { oom = true; break; }
+        }
+    }
+    if (oom) {
+        /* Free any allocated partition buffers */
+        for (uint32_t p = 0; p < n_parts; p++)
+            if (parts[p].entries_hdr) scratch_free(parts[p].entries_hdr);
+        scratch_free(hist_hdr);
+        scratch_free(parts_hdr);
+        *parts_hdr_out = NULL;
+        return NULL;
+    }
+
+    /* Step 2: Compute per-worker write offsets within each partition */
+    td_t* off_hdr;
+    uint32_t* offsets = (uint32_t*)scratch_alloc(&off_hdr,
+                          (size_t)n_workers * n_parts * sizeof(uint32_t));
+    if (!offsets) {
+        for (uint32_t p = 0; p < n_parts; p++)
+            if (parts[p].entries_hdr) scratch_free(parts[p].entries_hdr);
+        scratch_free(hist_hdr);
+        scratch_free(parts_hdr);
+        *parts_hdr_out = NULL;
+        return NULL;
+    }
+
+    for (uint32_t p = 0; p < n_parts; p++) {
+        uint32_t running = 0;
+        for (uint32_t w = 0; w < n_workers; w++) {
+            offsets[w * n_parts + p] = running;
+            running += histograms[w * n_parts + p];
+        }
+    }
+
+    /* Step 3: Scatter rows into partition buffers */
+    join_radix_scatter_ctx_t sctx = {
+        .key_vecs = key_vecs, .n_keys = n_keys,
+        .radix_mask = mask, .radix_shift = shift,
+        .n_parts = n_parts, .parts = parts,
+        .offsets = offsets,
+    };
+    if (pool && nrows > TD_PARALLEL_THRESHOLD)
+        td_pool_dispatch(pool, join_radix_scatter_fn, &sctx, nrows);
+    else
+        join_radix_scatter_fn(&sctx, 0, 0, nrows);
+
+    scratch_free(off_hdr);
+    scratch_free(hist_hdr);
+    return parts;
+}
+
+/* ============================================================================
  * Join execution (parallel hash join)
  *
  * Three-phase pipeline:
