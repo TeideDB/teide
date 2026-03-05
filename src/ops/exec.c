@@ -7654,6 +7654,139 @@ static inline bool join_keys_eq(td_t* const* l_vecs, td_t* const* r_vecs, uint8_
     return true;
 }
 
+/* ── Per-partition open-addressing build + probe ─────────────────────── */
+
+#define RADIX_HT_EMPTY UINT32_MAX
+
+/* Per-partition build+probe context */
+typedef struct {
+    /* Partition data */
+    join_radix_part_t*  l_parts;
+    join_radix_part_t*  r_parts;
+    /* Key vectors for equality check (global row indices) */
+    td_t**         l_key_vecs;
+    td_t**         r_key_vecs;
+    uint8_t        n_keys;
+    uint8_t        join_type;
+    /* Output: per-partition match counts (for prefix sum) */
+    int64_t*       part_counts;
+    /* Output: per-partition match pairs (filled in second call) */
+    int64_t*       l_idx;
+    int64_t*       r_idx;
+    int64_t*       part_offsets;   /* write offset per partition */
+    /* FULL OUTER: track matched right rows */
+    _Atomic(uint8_t)* matched_right;
+    /* Phase flag: 0=count, 1=fill */
+    uint8_t        phase;
+} join_radix_bp_ctx_t;
+
+static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_start, int64_t task_end) {
+    (void)wid; (void)task_end;
+    join_radix_bp_ctx_t* c = (join_radix_bp_ctx_t*)raw;
+    uint32_t p = (uint32_t)task_start;
+
+    join_radix_part_t* rp = &c->r_parts[p];
+    join_radix_part_t* lp = &c->l_parts[p];
+
+    if (rp->count == 0) {
+        /* No right rows in this partition */
+        if (c->phase == 0) {
+            c->part_counts[p] = (c->join_type >= 1) ? (int64_t)lp->count : 0;
+        } else if (c->join_type >= 1 && lp->count > 0) {
+            int64_t off = c->part_offsets[p];
+            for (uint32_t i = 0; i < lp->count; i++) {
+                c->l_idx[off] = lp->entries[i].row_idx;
+                c->r_idx[off] = -1;
+                off++;
+            }
+        }
+        return;
+    }
+
+    /* Build open-addressing HT for right partition */
+    uint32_t ht_cap = 256;
+    while (ht_cap < rp->count * 2) ht_cap *= 2;
+    uint32_t ht_mask = ht_cap - 1;
+
+    /* HT entries: [hash | row_idx] packed as two uint32_t */
+    td_t* ht_hdr;
+    uint32_t* ht = (uint32_t*)scratch_calloc(&ht_hdr, (size_t)ht_cap * 2 * sizeof(uint32_t));
+    if (!ht) {
+        if (c->phase == 0) c->part_counts[p] = 0;
+        return;
+    }
+    /* Initialize all slots to EMPTY */
+    for (uint32_t s = 0; s < ht_cap; s++)
+        ht[s * 2 + 1] = RADIX_HT_EMPTY;  /* row_idx slot */
+
+    /* Insert right-side entries */
+    for (uint32_t i = 0; i < rp->count; i++) {
+        uint32_t h = rp->entries[i].hash;
+        uint32_t slot = h & ht_mask;
+        /* Linear probe to find empty slot */
+        while (ht[slot * 2 + 1] != RADIX_HT_EMPTY)
+            slot = (slot + 1) & ht_mask;
+        ht[slot * 2] = h;
+        ht[slot * 2 + 1] = rp->entries[i].row_idx;
+    }
+
+    /* Probe with left-side entries */
+    if (c->phase == 0) {
+        /* Count phase */
+        int64_t count = 0;
+        for (uint32_t i = 0; i < lp->count; i++) {
+            uint32_t h = lp->entries[i].hash;
+            uint32_t lr = lp->entries[i].row_idx;
+            uint32_t slot = h & ht_mask;
+            bool matched = false;
+            while (ht[slot * 2 + 1] != RADIX_HT_EMPTY) {
+                if (ht[slot * 2] == h) {
+                    uint32_t rr = ht[slot * 2 + 1];
+                    if (join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys,
+                                     (int64_t)lr, (int64_t)rr)) {
+                        count++;
+                        matched = true;
+                    }
+                }
+                slot = (slot + 1) & ht_mask;
+            }
+            if (!matched && c->join_type >= 1) count++;
+        }
+        c->part_counts[p] = count;
+    } else {
+        /* Fill phase */
+        int64_t off = c->part_offsets[p];
+        for (uint32_t i = 0; i < lp->count; i++) {
+            uint32_t h = lp->entries[i].hash;
+            uint32_t lr = lp->entries[i].row_idx;
+            uint32_t slot = h & ht_mask;
+            bool matched = false;
+            while (ht[slot * 2 + 1] != RADIX_HT_EMPTY) {
+                if (ht[slot * 2] == h) {
+                    uint32_t rr = ht[slot * 2 + 1];
+                    if (join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys,
+                                     (int64_t)lr, (int64_t)rr)) {
+                        c->l_idx[off] = (int64_t)lr;
+                        c->r_idx[off] = (int64_t)rr;
+                        off++;
+                        matched = true;
+                        if (c->matched_right)
+                            atomic_store_explicit(&c->matched_right[rr], 1, memory_order_relaxed);
+                    }
+                }
+                slot = (slot + 1) & ht_mask;
+            }
+            if (!matched && c->join_type >= 1) {
+                c->l_idx[off] = (int64_t)lr;
+                c->r_idx[off] = -1;
+                off++;
+            }
+        }
+    }
+
+    scratch_free(ht_hdr);
+}
+
 /* ── Parallel join HT build ─────────────────────────────────────────────
  * Workers hash right-side rows in parallel and insert into the shared
  * chain-linked hash table using atomic CAS on ht_heads[slot].
