@@ -142,13 +142,11 @@ static void count_refs(td_graph_t* g, td_op_t* root, uint32_t* ref_counts) {
                         }
                         break;
                     case OP_WINDOW_JOIN:
-                        if (ext->wjoin.time_key && sp < (int)stack_cap)
-                            stack[sp++] = ext->wjoin.time_key->id;
-                        if (ext->wjoin.sym_key && sp < (int)stack_cap)
-                            stack[sp++] = ext->wjoin.sym_key->id;
-                        for (uint8_t k = 0; k < ext->wjoin.n_aggs; k++) {
-                            if (ext->wjoin.agg_inputs[k] && sp < (int)stack_cap)
-                                stack[sp++] = ext->wjoin.agg_inputs[k]->id;
+                        if (ext->asof.time_key && sp < (int)stack_cap)
+                            stack[sp++] = ext->asof.time_key->id;
+                        for (uint8_t k = 0; k < ext->asof.n_eq_keys; k++) {
+                            if (ext->asof.eq_keys[k] && sp < (int)stack_cap)
+                                stack[sp++] = ext->asof.eq_keys[k]->id;
                         }
                         break;
                     case OP_WINDOW:
