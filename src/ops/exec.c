@@ -8044,9 +8044,9 @@ join_cleanup:
 }
 
 /* ============================================================================
- * OP_WINDOW_JOIN: ASOF window join
- * For each left row, find the best matching right row within [time+lo, time+hi]
- * optionally partitioned by sym key, then gather aggregation columns.
+ * OP_WINDOW_JOIN: ASOF join (DuckDB-style sort-merge)
+ * For each left row, find the most recent right row where right.time <= left.time,
+ * optionally partitioned by equality keys. O(N+M) after sorting.
  * ============================================================================ */
 
 static td_t* exec_window_join(td_graph_t* g, td_op_t* op,
@@ -8054,110 +8054,214 @@ static td_t* exec_window_join(td_graph_t* g, td_op_t* op,
     td_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
 
-    int64_t  window_lo = ext->wjoin.window_lo;
-    int64_t  window_hi = ext->wjoin.window_hi;
-    uint8_t  n_aggs    = ext->wjoin.n_aggs;
+    uint8_t n_eq      = ext->asof.n_eq_keys;
+    uint8_t join_type = ext->asof.join_type;
 
     int64_t left_n  = td_table_nrows(left_table);
     int64_t right_n = td_table_nrows(right_table);
 
-    /* Resolve time key column from both tables */
-    td_op_ext_t* time_ext = find_ext(g, ext->wjoin.time_key->id);
+    /* Resolve time key */
+    td_op_ext_t* time_ext = find_ext(g, ext->asof.time_key->id);
     if (!time_ext || time_ext->base.opcode != OP_SCAN)
         return TD_ERR_PTR(TD_ERR_NYI);
     int64_t time_sym = time_ext->sym;
-    td_t* lt_time = td_table_get_col(left_table, time_sym);
-    td_t* rt_time = td_table_get_col(right_table, time_sym);
-    if (!lt_time || !rt_time) return TD_ERR_PTR(TD_ERR_SCHEMA);
 
-    int64_t* lt_data = (int64_t*)td_data(lt_time);
-    int64_t* rt_data = (int64_t*)td_data(rt_time);
-
-    /* Resolve optional sym key */
-    int64_t* lt_sym_data = NULL;
-    int64_t* rt_sym_data = NULL;
-    if (ext->wjoin.sym_key) {
-        td_op_ext_t* sym_ext = find_ext(g, ext->wjoin.sym_key->id);
-        if (!sym_ext || sym_ext->base.opcode != OP_SCAN)
+    /* Resolve equality keys */
+    int64_t eq_syms[256];
+    for (uint8_t k = 0; k < n_eq; k++) {
+        td_op_ext_t* ek = find_ext(g, ext->asof.eq_keys[k]->id);
+        if (!ek || ek->base.opcode != OP_SCAN)
             return TD_ERR_PTR(TD_ERR_NYI);
-        int64_t sym_sym = sym_ext->sym;
-        td_t* lt_sym_vec = td_table_get_col(left_table, sym_sym);
-        td_t* rt_sym_vec = td_table_get_col(right_table, sym_sym);
-        if (!lt_sym_vec || !rt_sym_vec) return TD_ERR_PTR(TD_ERR_SCHEMA);
-        lt_sym_data = (int64_t*)td_data(lt_sym_vec);
-        rt_sym_data = (int64_t*)td_data(rt_sym_vec);
+        eq_syms[k] = ek->sym;
     }
 
-    /* Build match index: for each left row, find best matching right row */
-    td_t* match_hdr = NULL;
-    int64_t* match_idx = (int64_t*)scratch_alloc(&match_hdr,
-                              (size_t)left_n * sizeof(int64_t));
-    if (!match_idx) return TD_ERR_PTR(TD_ERR_OOM);
+    /* Get time vectors */
+    td_t* lt_time_vec = td_table_get_col(left_table, time_sym);
+    td_t* rt_time_vec = td_table_get_col(right_table, time_sym);
+    if (!lt_time_vec || !rt_time_vec) return TD_ERR_PTR(TD_ERR_SCHEMA);
+    int64_t* lt_time = (int64_t*)td_data(lt_time_vec);
+    int64_t* rt_time = (int64_t*)td_data(rt_time_vec);
 
-    for (int64_t i = 0; i < left_n; i++) {
-        int64_t lt_t = lt_data[i];
-        int64_t lo = lt_t + window_lo;
-        int64_t hi = lt_t + window_hi;
-        int64_t best = -1;
-        int64_t best_time = INT64_MIN;
+    /* Get eq key vectors */
+    int64_t* lt_eq[256], *rt_eq[256];
+    for (uint8_t k = 0; k < n_eq; k++) {
+        td_t* lv = td_table_get_col(left_table, eq_syms[k]);
+        td_t* rv = td_table_get_col(right_table, eq_syms[k]);
+        if (!lv || !rv) return TD_ERR_PTR(TD_ERR_SCHEMA);
+        lt_eq[k] = (int64_t*)td_data(lv);
+        rt_eq[k] = (int64_t*)td_data(rv);
+    }
 
-        for (int64_t j = 0; j < right_n; j++) {
-            int64_t rt_t = rt_data[j];
-            if (rt_t < lo || rt_t > hi) continue;
-            if (lt_sym_data && rt_sym_data && lt_sym_data[i] != rt_sym_data[j])
-                continue;
-            if (rt_t > best_time) {
-                best_time = rt_t;
-                best = j;
+    /* Sort both tables by (eq_keys, time_key) using index arrays */
+    td_t* li_hdr = NULL, *ri_hdr = NULL;
+    int64_t* li_idx = (int64_t*)scratch_alloc(&li_hdr, (size_t)left_n * sizeof(int64_t));
+    int64_t* ri_idx = (int64_t*)scratch_alloc(&ri_hdr, (size_t)right_n * sizeof(int64_t));
+    if ((!li_idx && left_n > 0) || (!ri_idx && right_n > 0)) {
+        if (li_hdr) scratch_free(li_hdr);
+        if (ri_hdr) scratch_free(ri_hdr);
+        return TD_ERR_PTR(TD_ERR_OOM);
+    }
+    for (int64_t i = 0; i < left_n; i++) li_idx[i] = i;
+    for (int64_t i = 0; i < right_n; i++) ri_idx[i] = i;
+
+    /* Insertion sort on left indices */
+    for (int64_t i = 1; i < left_n; i++) {
+        int64_t key = li_idx[i];
+        int64_t j = i - 1;
+        while (j >= 0) {
+            int64_t o = li_idx[j];
+            int cmp = 0;
+            for (uint8_t k = 0; k < n_eq && cmp == 0; k++) {
+                if (lt_eq[k][key] < lt_eq[k][o]) cmp = -1;
+                else if (lt_eq[k][key] > lt_eq[k][o]) cmp = 1;
             }
+            if (cmp == 0) {
+                if (lt_time[key] < lt_time[o]) cmp = -1;
+                else if (lt_time[key] > lt_time[o]) cmp = 1;
+            }
+            if (cmp >= 0) break;
+            li_idx[j + 1] = li_idx[j];
+            j--;
         }
-        match_idx[i] = best;
+        li_idx[j + 1] = key;
+    }
+    /* Insertion sort on right indices */
+    for (int64_t i = 1; i < right_n; i++) {
+        int64_t key = ri_idx[i];
+        int64_t j = i - 1;
+        while (j >= 0) {
+            int64_t o = ri_idx[j];
+            int cmp = 0;
+            for (uint8_t k = 0; k < n_eq && cmp == 0; k++) {
+                if (rt_eq[k][key] < rt_eq[k][o]) cmp = -1;
+                else if (rt_eq[k][key] > rt_eq[k][o]) cmp = 1;
+            }
+            if (cmp == 0) {
+                if (rt_time[key] < rt_time[o]) cmp = -1;
+                else if (rt_time[key] > rt_time[o]) cmp = 1;
+            }
+            if (cmp >= 0) break;
+            ri_idx[j + 1] = ri_idx[j];
+            j--;
+        }
+        ri_idx[j + 1] = key;
     }
 
-    /* Build output table: all left columns + agg columns from right */
-    int64_t left_ncols = td_table_ncols(left_table);
-    td_t* out = td_table_new(left_ncols + n_aggs);
+    /* Build match array: for each left row (sorted), find best right match */
+    td_t* match_hdr = NULL;
+    int64_t* match = (int64_t*)scratch_alloc(&match_hdr, (size_t)left_n * sizeof(int64_t));
+    if (!match && left_n > 0) {
+        scratch_free(li_hdr); scratch_free(ri_hdr);
+        return TD_ERR_PTR(TD_ERR_OOM);
+    }
 
-    /* Copy left columns */
+    /* Two-pointer merge */
+    int64_t rp = 0;  /* right pointer */
+    for (int64_t lp = 0; lp < left_n; lp++) {
+        int64_t li = li_idx[lp];
+        match[lp] = -1;  /* no match yet */
+
+        /* Advance right pointer while right row is <= left row */
+        while (rp < right_n) {
+            int64_t ri = ri_idx[rp];
+            /* Check eq_keys match */
+            int eq_cmp = 0;
+            for (uint8_t k = 0; k < n_eq && eq_cmp == 0; k++) {
+                if (rt_eq[k][ri] < lt_eq[k][li]) eq_cmp = -1;
+                else if (rt_eq[k][ri] > lt_eq[k][li]) eq_cmp = 1;
+            }
+            if (eq_cmp > 0) break;  /* right partition past left partition */
+            if (eq_cmp == 0 && rt_time[ri] <= lt_time[li]) {
+                match[lp] = ri;  /* candidate — will be overwritten by later (closer) matches */
+            }
+            if (eq_cmp == 0 && rt_time[ri] > lt_time[li]) break;  /* past time window */
+            rp++;
+        }
+
+        /* The right pointer stays where it is for the next left row because:
+           - left is sorted by (eq_keys, time), so next left.time >= current left.time
+           - the right pointer only needs to advance further (merge property)
+           - if partitions change, we continue advancing naturally */
+    }
+
+    /* Count output rows */
+    int64_t out_n = 0;
+    if (join_type == 1) {
+        out_n = left_n;  /* left outer: all left rows */
+    } else {
+        for (int64_t i = 0; i < left_n; i++)
+            if (match[i] >= 0) out_n++;
+    }
+
+    /* Build output table */
+    int64_t left_ncols  = td_table_ncols(left_table);
+    int64_t right_ncols = td_table_ncols(right_table);
+
+    /* Collect right column indices, excluding duplicate key columns */
+    int64_t right_out_idx[256];
+    int64_t right_out_count = 0;
+    for (int64_t c = 0; c < right_ncols; c++) {
+        int64_t rname = td_table_col_name(right_table, c);
+        int skip = 0;
+        if (rname == time_sym) skip = 1;
+        for (uint8_t k = 0; k < n_eq && !skip; k++)
+            if (rname == eq_syms[k]) skip = 1;
+        if (!skip) right_out_idx[right_out_count++] = c;
+    }
+
+    td_t* out = td_table_new(left_ncols + right_out_count);
+
+    /* Gather left columns */
     for (int64_t c = 0; c < left_ncols; c++) {
         int64_t col_name = td_table_col_name(left_table, c);
-        td_t* col = td_table_get_col_idx(left_table, c);
-        td_retain(col);
-        out = td_table_add_col(out, col_name, col);
-        td_release(col);
+        td_t* src_col = td_table_get_col_idx(left_table, c);
+        int8_t ctype = src_col->type;
+        td_t* dst_col = td_vec_new(ctype, out_n);
+
+        uint8_t esz = td_type_sizes[ctype];
+        char* src = (char*)td_data(src_col);
+        char* dst = (char*)td_data(dst_col);
+        int64_t wi = 0;
+        for (int64_t lp = 0; lp < left_n; lp++) {
+            if (join_type == 0 && match[lp] < 0) continue;
+            int64_t li = li_idx[lp];
+            memcpy(dst + wi * esz, src + li * esz, esz);
+            wi++;
+        }
+        dst_col->len = out_n;
+        out = td_table_add_col(out, col_name, dst_col);
+        td_release(dst_col);
     }
 
-    /* Build aggregated right columns using match index */
-    for (uint8_t a = 0; a < n_aggs; a++) {
-        td_op_ext_t* agg_ext = find_ext(g, ext->wjoin.agg_inputs[a]->id);
-        if (!agg_ext || agg_ext->base.opcode != OP_SCAN) {
-            scratch_free(match_hdr); td_release(out);
-            return TD_ERR_PTR(TD_ERR_NYI);
-        }
-        int64_t  agg_sym   = agg_ext->sym;
-        td_t* rcol = td_table_get_col(right_table, agg_sym);
-        if (!rcol) { scratch_free(match_hdr); td_release(out); return TD_ERR_PTR(TD_ERR_SCHEMA); }
+    /* Gather right columns (excluding key duplicates) */
+    for (int64_t rc = 0; rc < right_out_count; rc++) {
+        int64_t cidx = right_out_idx[rc];
+        int64_t col_name = td_table_col_name(right_table, cidx);
+        td_t* src_col = td_table_get_col_idx(right_table, cidx);
+        int8_t ctype = src_col->type;
+        td_t* dst_col = td_vec_new(ctype, out_n);
 
-        int8_t rtype = rcol->type;
-        td_t* out_col = td_vec_new(rtype, left_n);
-
-        if (rtype == TD_F64) {
-            double* src = (double*)td_data(rcol);
-            double* dst = (double*)td_data(out_col);
-            for (int64_t i = 0; i < left_n; i++)
-                dst[i] = (match_idx[i] >= 0) ? src[match_idx[i]] : 0.0;
-        } else {
-            int64_t* src = (int64_t*)td_data(rcol);
-            int64_t* dst = (int64_t*)td_data(out_col);
-            for (int64_t i = 0; i < left_n; i++)
-                dst[i] = (match_idx[i] >= 0) ? src[match_idx[i]] : 0;
+        uint8_t esz = td_type_sizes[ctype];
+        char* src = (char*)td_data(src_col);
+        char* dst = (char*)td_data(dst_col);
+        int64_t wi = 0;
+        for (int64_t lp = 0; lp < left_n; lp++) {
+            if (join_type == 0 && match[lp] < 0) continue;
+            if (match[lp] >= 0) {
+                memcpy(dst + wi * esz, src + match[lp] * esz, esz);
+            } else {
+                memset(dst + wi * esz, 0, esz);  /* NULL fill for left outer */
+            }
+            wi++;
         }
-        out_col->len = left_n;
-        out = td_table_add_col(out, agg_sym, out_col);
-        td_release(out_col);
+        dst_col->len = out_n;
+        out = td_table_add_col(out, col_name, dst_col);
+        td_release(dst_col);
     }
 
     scratch_free(match_hdr);
+    scratch_free(li_hdr);
+    scratch_free(ri_hdr);
     return out;
 }
 
