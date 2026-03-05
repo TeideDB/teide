@@ -7802,6 +7802,11 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
                 c->pp_l[p] = pl; c->pp_r[p] = pr;
                 c->part_counts[p] = lp->count;
                 c->pp_cap[p] = cap;
+            } else {
+                if (c->pp_l_hdr[p]) scratch_free(c->pp_l_hdr[p]);
+                if (c->pp_r_hdr[p]) scratch_free(c->pp_r_hdr[p]);
+                c->pp_l_hdr[p] = NULL; c->pp_r_hdr[p] = NULL;
+                atomic_store_explicit(&c->had_error, 1, memory_order_relaxed);
             }
         }
         return;
@@ -7819,6 +7824,7 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
         if (c->pp_r_hdr[p]) scratch_free(c->pp_r_hdr[p]);
         c->pp_l_hdr[p] = NULL; c->pp_r_hdr[p] = NULL;
         c->part_counts[p] = 0;
+        atomic_store_explicit(&c->had_error, 1, memory_order_relaxed);
         return;
     }
     uint32_t cap = init_cap;
@@ -8270,6 +8276,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
             .pp_l_hdr = pp_l_hdr, .pp_r_hdr = pp_r_hdr,
             .part_counts = part_counts, .pp_cap = pp_cap,
             .matched_right = matched_right,
+            .had_error = 0,
         };
         if (pool && n_rparts > 1)
             td_pool_dispatch_n(pool, join_radix_build_probe_fn, &bp_ctx, n_rparts);
