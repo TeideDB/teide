@@ -1152,8 +1152,11 @@ td_t* td_read_csv_opts(const char* path, char delimiter, bool header,
             p++;
         }
     }
-    /* Columns beyond CSV_MAX_COLS (256) are silently dropped. */
-    if (ncols > CSV_MAX_COLS) ncols = CSV_MAX_COLS;
+    if (ncols > CSV_MAX_COLS) {
+        munmap(buf, file_size);
+        close(fd);
+        return TD_ERR_PTR(TD_ERR_RANGE);  /* too many columns */
+    }
 
     /* ---- 5. Parse header row ---- */
     const char* p = buf;
