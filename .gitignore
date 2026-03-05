@@ -5,3 +5,6 @@ build_*/
 
 # ralphex progress logs
 .ralphex/progress/
+
+# git worktrees
+.worktrees/
