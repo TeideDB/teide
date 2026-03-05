@@ -92,46 +92,45 @@
   <line x1="330" y1="272" x2="550" y2="272" stroke="#21262d" stroke-width="1"/>
   <g fill="#c9d1d9" font-size="11">
     <text x="330" y="292">Lock-free alloc</text>
-    <text x="330" y="312">Foreign-block deferred free</text>
+    <text x="330" y="312">Deferred free</text>
     <text x="330" y="332">Cross-thread reclaim</text>
-    <text x="330" y="352">COW: td_retain / td_release</text>
+    <text x="330" y="352">COW ref counting</text>
   </g>
 
   <!-- td_t block layout -->
   <text x="300" y="408" text-anchor="middle" fill="#8b949e" font-size="13" font-weight="600">td_t block layout (32 B, 32-byte aligned)</text>
 
-  <!-- Block diagram -->
+  <!-- Block diagram - size labels inside rows -->
   <g transform="translate(50, 420)">
     <!-- Row 1: nullmap -->
-    <rect x="0" y="0" width="450" height="30" rx="4" fill="url(#block)" stroke="#f0883e" stroke-width="1"/>
-    <text x="225" y="20" text-anchor="middle" fill="#f0883e" font-size="11" font-weight="600">nullmap / slice_parent / ext_nullmap</text>
-    <text x="462" y="20" fill="#484f58" font-size="10">16 B</text>
+    <rect x="0" y="0" width="500" height="30" rx="4" fill="url(#block)" stroke="#f0883e" stroke-width="1"/>
+    <text x="210" y="20" text-anchor="middle" fill="#f0883e" font-size="11" font-weight="600">nullmap / slice_parent / ext_nullmap</text>
+    <text x="475" y="20" text-anchor="middle" fill="#484f58" font-size="9">16 B</text>
 
     <!-- Row 2: metadata -->
-    <rect x="0" y="36" width="68" height="30" rx="4" fill="url(#block)" stroke="#58a6ff" stroke-width="1"/>
-    <text x="34" y="56" text-anchor="middle" fill="#58a6ff" font-size="10">mmod</text>
+    <rect x="0" y="36" width="74" height="30" rx="4" fill="url(#block)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="37" y="56" text-anchor="middle" fill="#58a6ff" font-size="10">mmod</text>
 
-    <rect x="74" y="36" width="68" height="30" rx="4" fill="url(#block)" stroke="#58a6ff" stroke-width="1"/>
-    <text x="108" y="56" text-anchor="middle" fill="#58a6ff" font-size="10">order</text>
+    <rect x="80" y="36" width="74" height="30" rx="4" fill="url(#block)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="117" y="56" text-anchor="middle" fill="#58a6ff" font-size="10">order</text>
 
-    <rect x="148" y="36" width="68" height="30" rx="4" fill="url(#block)" stroke="#3fb950" stroke-width="1"/>
-    <text x="182" y="56" text-anchor="middle" fill="#3fb950" font-size="10">type</text>
+    <rect x="160" y="36" width="74" height="30" rx="4" fill="url(#block)" stroke="#3fb950" stroke-width="1"/>
+    <text x="197" y="56" text-anchor="middle" fill="#3fb950" font-size="10">type</text>
 
-    <rect x="222" y="36" width="68" height="30" rx="4" fill="url(#block)" stroke="#58a6ff" stroke-width="1"/>
-    <text x="256" y="56" text-anchor="middle" fill="#58a6ff" font-size="10">attrs</text>
+    <rect x="240" y="36" width="74" height="30" rx="4" fill="url(#block)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="277" y="56" text-anchor="middle" fill="#58a6ff" font-size="10">attrs</text>
 
-    <rect x="296" y="36" width="154" height="30" rx="4" fill="url(#block)" stroke="#d2a8ff" stroke-width="1"/>
-    <text x="373" y="56" text-anchor="middle" fill="#d2a8ff" font-size="10">rc (atomic u32)</text>
-
-    <text x="462" y="56" fill="#484f58" font-size="10">8 B</text>
+    <rect x="320" y="36" width="180" height="30" rx="4" fill="url(#block)" stroke="#d2a8ff" stroke-width="1"/>
+    <text x="385" y="56" text-anchor="middle" fill="#d2a8ff" font-size="10">rc (atomic u32)</text>
+    <text x="475" y="56" text-anchor="middle" fill="#484f58" font-size="9">8 B</text>
 
     <!-- Row 3: value -->
-    <rect x="0" y="72" width="450" height="30" rx="4" fill="url(#block)" stroke="#f0883e" stroke-width="1"/>
-    <text x="225" y="92" text-anchor="middle" fill="#f0883e" font-size="11" font-weight="600">value: i64 / f64 / len / sso / obj*</text>
-    <text x="462" y="92" fill="#484f58" font-size="10">8 B</text>
+    <rect x="0" y="72" width="500" height="30" rx="4" fill="url(#block)" stroke="#f0883e" stroke-width="1"/>
+    <text x="210" y="92" text-anchor="middle" fill="#f0883e" font-size="11" font-weight="600">value: i64 / f64 / len / sso / obj*</text>
+    <text x="475" y="92" text-anchor="middle" fill="#484f58" font-size="9">8 B</text>
 
     <!-- Row 4: data -->
-    <rect x="0" y="108" width="450" height="30" rx="4" fill="#1a2332" stroke="#484f58" stroke-width="1" stroke-dasharray="4,3"/>
-    <text x="225" y="128" text-anchor="middle" fill="#8b949e" font-size="10">data[] (flexible array, 2^order - 32 bytes)</text>
+    <rect x="0" y="108" width="500" height="30" rx="4" fill="#1a2332" stroke="#484f58" stroke-width="1" stroke-dasharray="4,3"/>
+    <text x="250" y="128" text-anchor="middle" fill="#8b949e" font-size="10">data[] (flexible array, 2^order - 32 bytes)</text>
   </g>
 </svg>
