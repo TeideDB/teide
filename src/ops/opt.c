@@ -135,10 +135,10 @@ static void pass_type_inference(td_graph_t* g, td_op_t* root) {
                 case OP_WINDOW_JOIN: {
                     td_op_ext_t* wj_ext = find_ext(g, n->id);
                     if (wj_ext) {
-                        if (wj_ext->asof.time_key && !visited[wj_ext->asof.time_key->id])
+                        if (wj_ext->asof.time_key && !visited[wj_ext->asof.time_key->id] && sp < (int)nc)
                             stack[sp++] = wj_ext->asof.time_key->id;
                         for (uint8_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
-                            if (wj_ext->asof.eq_keys[k] && !visited[wj_ext->asof.eq_keys[k]->id])
+                            if (wj_ext->asof.eq_keys[k] && !visited[wj_ext->asof.eq_keys[k]->id] && sp < (int)nc)
                                 stack[sp++] = wj_ext->asof.eq_keys[k]->id;
                         }
                     }
@@ -573,10 +573,10 @@ static void pass_constant_fold(td_graph_t* g, td_op_t* root) {
                 case OP_WINDOW_JOIN: {
                     td_op_ext_t* wj_ext = find_ext(g, n->id);
                     if (wj_ext) {
-                        if (wj_ext->asof.time_key && !visited[wj_ext->asof.time_key->id])
+                        if (wj_ext->asof.time_key && !visited[wj_ext->asof.time_key->id] && sp < (int)nc)
                             stack[sp++] = wj_ext->asof.time_key->id;
                         for (uint8_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
-                            if (wj_ext->asof.eq_keys[k] && !visited[wj_ext->asof.eq_keys[k]->id])
+                            if (wj_ext->asof.eq_keys[k] && !visited[wj_ext->asof.eq_keys[k]->id] && sp < (int)nc)
                                 stack[sp++] = wj_ext->asof.eq_keys[k]->id;
                         }
                     }
@@ -719,10 +719,10 @@ static void mark_live(td_graph_t* g, td_op_t* root, bool* live) {
                     case OP_WINDOW_JOIN: {
                         td_op_ext_t* wj_ext = find_ext(g, n->id);
                         if (wj_ext) {
-                            if (wj_ext->asof.time_key && !live[wj_ext->asof.time_key->id])
+                            if (wj_ext->asof.time_key && !live[wj_ext->asof.time_key->id] && sp < (int)stack_cap)
                                 stack[sp++] = wj_ext->asof.time_key->id;
                             for (uint8_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
-                                if (wj_ext->asof.eq_keys[k] && !live[wj_ext->asof.eq_keys[k]->id])
+                                if (wj_ext->asof.eq_keys[k] && !live[wj_ext->asof.eq_keys[k]->id] && sp < (int)stack_cap)
                                     stack[sp++] = wj_ext->asof.eq_keys[k]->id;
                             }
                         }
