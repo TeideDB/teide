@@ -62,6 +62,22 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(teide PUBLIC m pthread)
 endif()
 
+# Fuzz targets (requires clang with libFuzzer)
+option(TEIDE_FUZZ "Build fuzz testing targets" OFF)
+if(TEIDE_FUZZ)
+    file(GLOB FUZZ_SOURCES CONFIGURE_DEPENDS "fuzz/*.c")
+    foreach(fuzz_src ${FUZZ_SOURCES})
+        get_filename_component(fuzz_name ${fuzz_src} NAME_WE)
+        add_executable(${fuzz_name} ${fuzz_src})
+        target_link_libraries(${fuzz_name} PRIVATE teide_static)
+        target_include_directories(${fuzz_name} PRIVATE include src)
+        target_compile_options(${fuzz_name} PRIVATE
+            -fsanitize=fuzzer,address,undefined -g -O1)
+        target_link_options(${fuzz_name} PRIVATE
+            -fsanitize=fuzzer,address,undefined)
+    endforeach()
+endif()
+
 # Test executable
 enable_testing()
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "test/*.c")
