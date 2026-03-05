@@ -816,6 +816,61 @@ static MunitResult test_exec_join_large(const void* params, void* data) {
     return MUNIT_OK;
 }
 
+/* ---- JOIN FALLBACK (chained HT when radix OOM) ---- */
+static MunitResult test_exec_join_fallback(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    /* Use a small join — right_rows (4) < TD_PARALLEL_THRESHOLD so this
+     * always exercises the chained HT fallback path, never the radix path. */
+    int64_t lid[] = {1, 2, 3};
+    int64_t lval[] = {10, 20, 30};
+    td_t* lid_v = td_vec_from_raw(TD_I64, lid, 3);
+    td_t* lval_v = td_vec_from_raw(TD_I64, lval, 3);
+    int64_t n_id = td_sym_intern("id", 2);
+    int64_t n_val = td_sym_intern("val", 3);
+    td_t* left = td_table_new(2);
+    left = td_table_add_col(left, n_id, lid_v);
+    left = td_table_add_col(left, n_val, lval_v);
+    td_release(lid_v);
+    td_release(lval_v);
+
+    int64_t rid[] = {1, 2, 2, 3};
+    int64_t rscore[] = {100, 200, 201, 300};
+    td_t* rid_v = td_vec_from_raw(TD_I64, rid, 4);
+    td_t* rscore_v = td_vec_from_raw(TD_I64, rscore, 4);
+    int64_t n_score = td_sym_intern("score", 5);
+    td_t* right = td_table_new(2);
+    right = td_table_add_col(right, n_id, rid_v);
+    right = td_table_add_col(right, n_score, rscore_v);
+    td_release(rid_v);
+    td_release(rscore_v);
+
+    td_graph_t* g = td_graph_new(left);
+    td_op_t* left_op = td_const_table(g, left);
+    td_op_t* right_op = td_const_table(g, right);
+    td_op_t* lk = td_scan(g, "id");
+    td_op_t* lk_arr[] = { lk };
+    td_op_t* rk_arr[] = { lk };
+    td_op_t* join_op = td_join(g, left_op, lk_arr, right_op, rk_arr, 1, 0);
+
+    td_t* result = td_execute(g, join_op);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->type, ==, TD_TABLE);
+    /* 1->1, 2->2(twice), 3->1 = 4 result rows */
+    munit_assert_int(td_table_nrows(result), ==, 4);
+    munit_assert_true(td_table_ncols(result) >= 3);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(left);
+    td_release(right);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
 /* ---- WINDOW ---- */
 static MunitResult test_exec_window(const void* params, void* data) {
     (void)params; (void)data;
@@ -1239,6 +1294,7 @@ static MunitTest exec_tests[] = {
     { "/head_tail",      test_exec_head_tail,         NULL, NULL, 0, NULL },
     { "/join",           test_exec_join,              NULL, NULL, 0, NULL },
     { "/join_large",     test_exec_join_large,        NULL, NULL, 0, NULL },
+    { "/join_fallback",  test_exec_join_fallback,     NULL, NULL, 0, NULL },
     { "/window",         test_exec_window,            NULL, NULL, 0, NULL },
     { "/select",         test_exec_select,            NULL, NULL, 0, NULL },
     { "/stddev",         test_exec_stddev,            NULL, NULL, 0, NULL },

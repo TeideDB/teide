@@ -18,7 +18,7 @@
 - [x] Task 4: Wire radix join into exec_join
 - [x] Task 5: Add join correctness tests
 - [x] Task 6: Benchmark and tune
-- [ ] Task 7: Add memory pressure sequential fallback test
+- [x] Task 7: Add memory pressure sequential fallback test
 
 ---
 
