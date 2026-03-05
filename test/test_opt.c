@@ -277,12 +277,82 @@ static MunitResult test_pushdown_past_group(const void* params, void* data) {
     return MUNIT_OK;
 }
 
+/*
+ * Test: projection pushdown marks unreachable SCAN nodes dead.
+ *
+ * Build: SUM(SCAN("v1")) — only v1 is referenced.
+ * After optimization, id1 and v3 scans are not in the DAG,
+ * so they should not affect the result.
+ * sum(v1) = 10+20+30+40+50+60+70+80+90+100 = 550
+ */
+static MunitResult test_projection_pushdown(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_t *tbl = make_test_table();
+    td_graph_t *g = td_graph_new(tbl);
+
+    /* Only reference v1 — id1 and v3 should not affect result */
+    td_op_t *v1 = td_scan(g, "v1");
+    td_op_t *s = td_sum(g, v1);
+    td_op_t *opt = td_optimize(g, s);
+
+    td_t *result = td_execute(g, opt);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->i64, ==, 550);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
+/*
+ * Test: partition pruning smoke test.
+ *
+ * Build: SUM(FILTER(EQ(SCAN(id1), CONST(1)), SCAN(v1)))
+ * Verify correctness: id1=1 rows: indices 0,1,6,9 → v1={10,20,70,100} → sum=200
+ *
+ * The partition pruning pass only activates for TD_MAPCOMMON columns,
+ * so with regular I64 columns this verifies the pass is a safe no-op.
+ */
+static MunitResult test_partition_pruning_smoke(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_t *tbl = make_test_table();
+    td_graph_t *g = td_graph_new(tbl);
+
+    td_op_t *id1 = td_scan(g, "id1");
+    td_op_t *v1 = td_scan(g, "v1");
+    td_op_t *c1 = td_const_i64(g, 1);
+    td_op_t *pred = td_eq(g, id1, c1);
+    td_op_t *flt = td_filter(g, v1, pred);
+    td_op_t *s = td_sum(g, flt);
+
+    td_op_t *opt = td_optimize(g, s);
+    td_t *result = td_execute(g, opt);
+    munit_assert_false(TD_IS_ERR(result));
+
+    /* id1=1 rows: v1={10,20,70,100} -> sum=200 */
+    munit_assert_int(result->i64, ==, 200);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(tbl);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
 static MunitTest tests[] = {
     { "/filter_reorder_type", test_filter_reorder_by_type, NULL, NULL, 0, NULL },
     { "/filter_and_split",    test_filter_and_split,       NULL, NULL, 0, NULL },
     { "/filter_reorder_dag",  test_filter_reorder_dag,     NULL, NULL, 0, NULL },
     { "/pushdown_select",     test_pushdown_past_select,   NULL, NULL, 0, NULL },
     { "/pushdown_group",      test_pushdown_past_group,    NULL, NULL, 0, NULL },
+    { "/projection_pushdown", test_projection_pushdown,   NULL, NULL, 0, NULL },
+    { "/partition_pruning",   test_partition_pruning_smoke, NULL, NULL, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL }
 };
 

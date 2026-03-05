@@ -1452,6 +1452,189 @@ static td_op_t* pass_filter_reorder(td_graph_t* g, td_op_t* root) {
 }
 
 /* --------------------------------------------------------------------------
+ * Pass 7: Projection pushdown
+ *
+ * BFS from root collecting all reachable node IDs (following inputs and
+ * ext-node children).  Any node not reachable is marked DEAD so the DCE
+ * pass can clean it up.
+ * -------------------------------------------------------------------------- */
+
+static void pass_projection_pushdown(td_graph_t* g, td_op_t* root) {
+    if (!g || !root) return;
+    uint32_t nc = g->node_count;
+
+    bool live_stack[256];
+    bool* live = nc <= 256 ? live_stack : (bool*)td_sys_alloc(nc * sizeof(bool));
+    uint32_t q_stack[256];
+    uint32_t* q = nc <= 256 ? q_stack : (uint32_t*)td_sys_alloc(nc * sizeof(uint32_t));
+    if (!live || !q) { if (nc > 256) { td_sys_free(live); td_sys_free(q); } return; }
+    memset(live, 0, nc * sizeof(bool));
+
+    /* BFS from root */
+    int qh = 0, qt = 0;
+    q[qt++] = root->id;
+    live[root->id] = true;
+
+    while (qh < qt) {
+        uint32_t nid = q[qh++];
+        td_op_t* n = &g->nodes[nid];
+
+        /* Follow standard inputs */
+        for (int i = 0; i < 2 && i < n->arity; i++) {
+            if (n->inputs[i] && !live[n->inputs[i]->id]) {
+                live[n->inputs[i]->id] = true;
+                if (qt < (int)nc) q[qt++] = n->inputs[i]->id;
+            }
+        }
+
+        /* Follow ext node children (mirrors pass_type_inference traversal) */
+        td_op_ext_t* ext = find_ext(g, nid);
+        if (ext) {
+            switch (n->opcode) {
+                case OP_GROUP:
+                    for (uint8_t k = 0; k < ext->n_keys; k++)
+                        if (ext->keys[k] && !live[ext->keys[k]->id]) {
+                            live[ext->keys[k]->id] = true;
+                            if (qt < (int)nc) q[qt++] = ext->keys[k]->id;
+                        }
+                    for (uint8_t a = 0; a < ext->n_aggs; a++)
+                        if (ext->agg_ins[a] && !live[ext->agg_ins[a]->id]) {
+                            live[ext->agg_ins[a]->id] = true;
+                            if (qt < (int)nc) q[qt++] = ext->agg_ins[a]->id;
+                        }
+                    break;
+                case OP_SORT:
+                case OP_SELECT:
+                    for (uint8_t k = 0; k < ext->sort.n_cols; k++)
+                        if (ext->sort.columns[k] && !live[ext->sort.columns[k]->id]) {
+                            live[ext->sort.columns[k]->id] = true;
+                            if (qt < (int)nc) q[qt++] = ext->sort.columns[k]->id;
+                        }
+                    break;
+                case OP_JOIN:
+                    for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
+                        if (ext->join.left_keys[k] && !live[ext->join.left_keys[k]->id]) {
+                            live[ext->join.left_keys[k]->id] = true;
+                            if (qt < (int)nc) q[qt++] = ext->join.left_keys[k]->id;
+                        }
+                        if (ext->join.right_keys && ext->join.right_keys[k] &&
+                            !live[ext->join.right_keys[k]->id]) {
+                            live[ext->join.right_keys[k]->id] = true;
+                            if (qt < (int)nc) q[qt++] = ext->join.right_keys[k]->id;
+                        }
+                    }
+                    break;
+                case OP_WINDOW_JOIN: {
+                    td_op_ext_t* wj_ext = find_ext(g, n->id);
+                    if (wj_ext) {
+                        if (wj_ext->asof.time_key && !live[wj_ext->asof.time_key->id]) {
+                            live[wj_ext->asof.time_key->id] = true;
+                            if (qt < (int)nc) q[qt++] = wj_ext->asof.time_key->id;
+                        }
+                        for (uint8_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
+                            if (wj_ext->asof.eq_keys[k] && !live[wj_ext->asof.eq_keys[k]->id]) {
+                                live[wj_ext->asof.eq_keys[k]->id] = true;
+                                if (qt < (int)nc) q[qt++] = wj_ext->asof.eq_keys[k]->id;
+                            }
+                        }
+                    }
+                    break;
+                }
+                case OP_WINDOW:
+                    for (uint8_t k = 0; k < ext->window.n_part_keys; k++)
+                        if (ext->window.part_keys[k] && !live[ext->window.part_keys[k]->id]) {
+                            live[ext->window.part_keys[k]->id] = true;
+                            if (qt < (int)nc) q[qt++] = ext->window.part_keys[k]->id;
+                        }
+                    for (uint8_t k = 0; k < ext->window.n_order_keys; k++)
+                        if (ext->window.order_keys[k] && !live[ext->window.order_keys[k]->id]) {
+                            live[ext->window.order_keys[k]->id] = true;
+                            if (qt < (int)nc) q[qt++] = ext->window.order_keys[k]->id;
+                        }
+                    for (uint8_t f = 0; f < ext->window.n_funcs; f++)
+                        if (ext->window.func_inputs[f] && !live[ext->window.func_inputs[f]->id]) {
+                            live[ext->window.func_inputs[f]->id] = true;
+                            if (qt < (int)nc) q[qt++] = ext->window.func_inputs[f]->id;
+                        }
+                    break;
+                case OP_IF:
+                case OP_SUBSTR:
+                case OP_REPLACE: {
+                    uint32_t third_id = (uint32_t)(uintptr_t)ext->literal;
+                    if (third_id < nc && !live[third_id]) {
+                        live[third_id] = true;
+                        if (qt < (int)nc) q[qt++] = third_id;
+                    }
+                    break;
+                }
+                case OP_CONCAT:
+                    if (ext->sym >= 2) {
+                        int n_args = (int)ext->sym;
+                        uint32_t* trail = (uint32_t*)((char*)(ext + 1));
+                        for (int j = 2; j < n_args; j++) {
+                            uint32_t arg_id = trail[j - 2];
+                            if (arg_id < nc && !live[arg_id]) {
+                                live[arg_id] = true;
+                                if (qt < (int)nc) q[qt++] = arg_id;
+                            }
+                        }
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    /* Mark unreachable nodes DEAD */
+    for (uint32_t i = 0; i < nc; i++) {
+        if (!live[i])
+            g->nodes[i].flags |= OP_FLAG_DEAD;
+    }
+
+    if (nc > 256) { td_sys_free(live); td_sys_free(q); }
+}
+
+/* --------------------------------------------------------------------------
+ * Pass 8: Partition pruning
+ *
+ * Recognize FILTER(EQ(SCAN(mapcommon_col), CONST(val))) patterns and set
+ * est_rows=1 to hint that most partitions can be skipped at execution time.
+ * -------------------------------------------------------------------------- */
+
+static void pass_partition_pruning(td_graph_t* g, td_op_t* root) {
+    if (!g || !root) return;
+    (void)root; /* linear scan over all nodes, root unused */
+
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        td_op_t* n = &g->nodes[i];
+        if (n->flags & OP_FLAG_DEAD) continue;
+        if (n->opcode != OP_FILTER || n->arity != 2) continue;
+
+        td_op_t* pred = n->inputs[1];
+        if (!pred || pred->opcode != OP_EQ || pred->arity != 2) continue;
+
+        td_op_t* lhs = pred->inputs[0];
+        td_op_t* rhs = pred->inputs[1];
+        if (!lhs || !rhs) continue;
+
+        td_op_t* scan_node = NULL;
+        td_op_t* const_node = NULL;
+        if (lhs->opcode == OP_SCAN && rhs->opcode == OP_CONST) {
+            scan_node = lhs; const_node = rhs;
+        } else if (rhs->opcode == OP_SCAN && lhs->opcode == OP_CONST) {
+            scan_node = rhs; const_node = lhs;
+        } else continue;
+
+        if (scan_node->out_type != TD_MAPCOMMON) continue;
+
+        /* Mark hint: most partitions can be skipped */
+        n->est_rows = 1;
+        (void)const_node; /* value used at runtime, not needed here */
+    }
+}
+
+/* --------------------------------------------------------------------------
  * td_optimize — run all passes in order, return (possibly updated) root
  * -------------------------------------------------------------------------- */
 
@@ -1476,10 +1659,16 @@ td_op_t* td_optimize(td_graph_t* g, td_op_t* root) {
     /* Pass 6: Filter reordering (split ANDs + reorder by cost, may change root) */
     root = pass_filter_reorder(g, root);
 
-    /* Pass 7: Fusion */
+    /* Pass 7: Projection pushdown (mark unreachable nodes dead) */
+    pass_projection_pushdown(g, root);
+
+    /* Pass 8: Partition pruning (set est_rows hints for mapcommon filters) */
+    pass_partition_pruning(g, root);
+
+    /* Pass 9: Fusion */
     td_fuse_pass(g, root);
 
-    /* Pass 8: DCE */
+    /* Pass 10: DCE */
     pass_dce(g, root);
 
     return root;

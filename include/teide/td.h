@@ -907,6 +907,13 @@ void      td_rel_free(td_rel_t* rel);
 td_op_t* td_optimize(td_graph_t* g, td_op_t* root);
 void     td_fuse_pass(td_graph_t* g, td_op_t* root);
 
+/* ===== Plan Printer ===== */
+
+/* Print human-readable query plan rooted at `root` to `out`.
+ * `out` is a FILE* (caller must include <stdio.h>).
+ * If out is NULL, prints to stderr. */
+void td_graph_dump(td_graph_t* g, td_op_t* root, void* out);
+
 /* ===== Executor API ===== */
 
 td_t* td_execute(td_graph_t* g, td_op_t* root);
