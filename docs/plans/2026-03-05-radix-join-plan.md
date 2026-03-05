@@ -10,6 +10,18 @@
 
 ---
 
+## Progress
+
+- [ ] Task 1: Add radix join constants to td.h
+- [ ] Task 2: Implement radix bit selection and partition count/scatter infrastructure
+- [ ] Task 3: Implement per-partition open-addressing build + probe
+- [ ] Task 4: Wire radix join into exec_join
+- [ ] Task 5: Add join correctness tests
+- [ ] Task 6: Benchmark and tune
+- [ ] Task 7: Add memory pressure sequential fallback test
+
+---
+
 ### Task 1: Add radix join constants to td.h
 
 **Files:**
