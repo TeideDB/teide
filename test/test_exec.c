@@ -805,7 +805,20 @@ static MunitResult test_exec_join_large(const void* params, void* data) {
     munit_assert_int(result->type, ==, TD_TABLE);
     /* 50K keys, 2 left x 2 right = 4 matches per key, total = 200K rows */
     munit_assert_int(td_table_nrows(result), ==, 200000);
-    munit_assert_true(td_table_ncols(result) >= 3);
+    munit_assert_int(td_table_ncols(result), ==, 3);
+
+    /* Validate data: sum of "score" column should equal the expected value.
+     * Each right row (score = i*10) matches 2 left rows, so each right row
+     * appears twice in the output. Expected sum = 2 * sum(i*10 for i=0..99999)
+     * = 2 * 10 * (99999 * 100000 / 2) = 99999000000 */
+    td_t* score_col = td_table_get_col(result, n_score);
+    munit_assert_true(score_col != NULL);
+    int64_t* scores = (int64_t*)td_data(score_col);
+    int64_t score_sum = 0;
+    for (int64_t i = 0; i < 200000; i++)
+        score_sum += scores[i];
+    int64_t expected_sum = (int64_t)2 * 10 * ((int64_t)99999 * 100000 / 2);
+    munit_assert_true(score_sum == expected_sum);
 
     td_release(result);
     td_graph_free(g);
@@ -816,31 +829,49 @@ static MunitResult test_exec_join_large(const void* params, void* data) {
     return MUNIT_OK;
 }
 
-/* ---- JOIN FALLBACK (chained HT when radix OOM) ---- */
+/* ---- JOIN: small left x large right (asymmetric radix path) ---- */
 static MunitResult test_exec_join_fallback(const void* params, void* data) {
     (void)params; (void)data;
     td_heap_init();
     td_sym_init();
 
-    /* Use a small join — right_rows (4) < TD_PARALLEL_THRESHOLD so this
-     * always exercises the chained HT fallback path, never the radix path. */
-    int64_t lid[] = {1, 2, 3};
-    int64_t lval[] = {10, 20, 30};
-    td_t* lid_v = td_vec_from_raw(TD_I64, lid, 3);
-    td_t* lval_v = td_vec_from_raw(TD_I64, lval, 3);
+    /* Left table: 100 rows (small), id = i, val = i * 7
+     * Right table: 100K rows (large, triggers radix path), id = i % 100
+     * Each left row matches 1000 right rows → 100 * 1000 = 100K output rows */
+    int64_t n_left_rows = 100;
+    td_t* lid_v = td_vec_new(TD_I64, n_left_rows);
+    lid_v->len = n_left_rows;
+    td_t* lval_v = td_vec_new(TD_I64, n_left_rows);
+    lval_v->len = n_left_rows;
+    int64_t* lid2 = (int64_t*)td_data(lid_v);
+    int64_t* lval2 = (int64_t*)td_data(lval_v);
+    for (int64_t i = 0; i < n_left_rows; i++) {
+        lid2[i] = i;
+        lval2[i] = i * 7;
+    }
+
+    int64_t n_right_rows = 100000;
+    td_t* rid_v = td_vec_new(TD_I64, n_right_rows);
+    rid_v->len = n_right_rows;
+    td_t* rscore_v = td_vec_new(TD_I64, n_right_rows);
+    rscore_v->len = n_right_rows;
+    int64_t* rid2 = (int64_t*)td_data(rid_v);
+    int64_t* rscore2 = (int64_t*)td_data(rscore_v);
+    for (int64_t i = 0; i < n_right_rows; i++) {
+        rid2[i] = i % 100;
+        rscore2[i] = i;
+    }
+
     int64_t n_id = td_sym_intern("id", 2);
     int64_t n_val = td_sym_intern("val", 3);
+    int64_t n_score = td_sym_intern("score", 5);
+
     td_t* left = td_table_new(2);
     left = td_table_add_col(left, n_id, lid_v);
     left = td_table_add_col(left, n_val, lval_v);
     td_release(lid_v);
     td_release(lval_v);
 
-    int64_t rid[] = {1, 2, 2, 3};
-    int64_t rscore[] = {100, 200, 201, 300};
-    td_t* rid_v = td_vec_from_raw(TD_I64, rid, 4);
-    td_t* rscore_v = td_vec_from_raw(TD_I64, rscore, 4);
-    int64_t n_score = td_sym_intern("score", 5);
     td_t* right = td_table_new(2);
     right = td_table_add_col(right, n_id, rid_v);
     right = td_table_add_col(right, n_score, rscore_v);
@@ -858,9 +889,19 @@ static MunitResult test_exec_join_fallback(const void* params, void* data) {
     td_t* result = td_execute(g, join_op);
     munit_assert_false(TD_IS_ERR(result));
     munit_assert_int(result->type, ==, TD_TABLE);
-    /* 1->1, 2->2(twice), 3->1 = 4 result rows */
-    munit_assert_int(td_table_nrows(result), ==, 4);
-    munit_assert_true(td_table_ncols(result) >= 3);
+    /* 100 left rows * 1000 right matches each = 100K output rows */
+    munit_assert_int(td_table_nrows(result), ==, 100000);
+    munit_assert_int(td_table_ncols(result), ==, 3);
+
+    /* Validate: every output row's "val" should be id * 7 */
+    td_t* res_id_col = td_table_get_col(result, n_id);
+    td_t* res_val_col = td_table_get_col(result, n_val);
+    munit_assert_true(res_id_col != NULL);
+    munit_assert_true(res_val_col != NULL);
+    int64_t* res_ids = (int64_t*)td_data(res_id_col);
+    int64_t* res_vals = (int64_t*)td_data(res_val_col);
+    for (int64_t i = 0; i < td_table_nrows(result); i++)
+        munit_assert_true(res_vals[i] == res_ids[i] * 7);
 
     td_release(result);
     td_graph_free(g);

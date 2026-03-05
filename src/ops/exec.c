@@ -7638,8 +7638,10 @@ static join_radix_part_t* join_radix_partition(td_pool_t* pool, int64_t nrows,
     if (!parts) { *parts_hdr_out = NULL; return NULL; }
     *parts_hdr_out = parts_hdr;
 
-    /* Step 1: Histogram — count rows per partition per worker */
-    uint32_t n_workers = pool ? pool->n_workers + 1 : 1;  /* +1 for main thread */
+    /* Step 1: Histogram — count rows per partition per worker.
+     * n_workers must match dispatch: 1 when running serially so that the
+     * single hist/scatter call covers all rows (chunk = nrows / 1). */
+    uint32_t n_workers = (pool && nrows > TD_PARALLEL_THRESHOLD) ? pool->n_workers + 1 : 1;
     td_t* hist_hdr;
     uint32_t* histograms = (uint32_t*)scratch_calloc(&hist_hdr,
                              (size_t)n_workers * n_parts * sizeof(uint32_t));
@@ -7824,7 +7826,8 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
 
     /* Build open-addressing HT for right partition */
     uint32_t ht_cap = 256;
-    while (ht_cap < rp->count * 2) ht_cap *= 2;
+    uint64_t ht_target = (uint64_t)rp->count * 2;
+    while ((uint64_t)ht_cap < ht_target && ht_cap <= (UINT32_MAX >> 1)) ht_cap *= 2;
     uint32_t ht_mask = ht_cap - 1;
 
     td_t* ht_hdr;
@@ -8103,8 +8106,8 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
 
     int64_t left_rows = td_table_nrows(left_table);
     int64_t right_rows = td_table_nrows(right_table);
-    /* Guard: uint32_t row indices in HT chains cannot represent >4B rows */
-    if (right_rows > (int64_t)(UINT32_MAX - 1))
+    /* Guard: uint32_t row indices in HT chains / radix entries cannot represent >4B rows */
+    if (right_rows > (int64_t)(UINT32_MAX - 1) || left_rows > (int64_t)(UINT32_MAX - 1))
         return TD_ERR_PTR(TD_ERR_NYI);
     uint8_t n_keys = ext->join.n_join_keys;
     uint8_t join_type = ext->join.join_type;
@@ -8542,20 +8545,6 @@ join_gather:;
     result = td_table_new(left_ncols + right_ncols);
     if (!result || TD_IS_ERR(result)) goto join_cleanup;
 
-    /* Count non-key right columns for multi_gather sizing */
-    int64_t right_out_ncols __attribute__((unused)) = 0;
-    for (int64_t c = 0; c < right_ncols; c++) {
-        int64_t name_id = td_table_col_name(right_table, c);
-        bool is_key = false;
-        for (uint8_t k = 0; k < n_keys; k++) {
-            td_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]->id);
-            if (rk && rk->base.opcode == OP_SCAN && rk->sym == name_id) {
-                is_key = true; break;
-            }
-        }
-        if (!is_key) right_out_ncols++;
-    }
-
     /* Allocate all output columns upfront for batched gather */
     td_t* l_out_cols[MGATHER_MAX_COLS];
     int64_t l_out_names[MGATHER_MAX_COLS];
@@ -8602,19 +8591,12 @@ join_gather:;
         bool l_nullable = (join_type == 2);  /* only FULL OUTER */
         if (!l_nullable && l_out_count > 1 && l_out_count <= MGATHER_MAX_COLS) {
             multi_gather_ctx_t mgctx = { .idx = l_idx, .ncols = l_out_count };
-            for (int64_t i = 0; i < l_out_count; i++) {
-                mgctx.srcs[i] = (char*)td_data(td_table_get_col_idx(left_table,
-                    /* find col with name l_out_names[i] */
-                    i < left_ncols ? i : 0));
-                mgctx.dsts[i] = (char*)td_data(l_out_cols[i]);
-                mgctx.esz[i] = col_esz(l_out_cols[i]);
-            }
-            /* Rebuild srcs correctly by matching original column order */
             int64_t si = 0;
             for (int64_t c = 0; c < left_ncols && si < l_out_count; c++) {
                 td_t* col = td_table_get_col_idx(left_table, c);
                 if (!col) continue;
                 mgctx.srcs[si] = (char*)td_data(col);
+                mgctx.dsts[si] = (char*)td_data(l_out_cols[si]);
                 mgctx.esz[si] = col_esz(col);
                 si++;
             }
