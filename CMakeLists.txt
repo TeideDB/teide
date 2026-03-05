@@ -91,6 +91,23 @@ if(TEIDE_BENCH)
     endforeach()
 endif()
 
+# Example targets
+option(TEIDE_EXAMPLES "Build example executables" OFF)
+if(TEIDE_EXAMPLES)
+    file(GLOB EXAMPLE_SOURCES CONFIGURE_DEPENDS "examples/*.c")
+    foreach(ex_src ${EXAMPLE_SOURCES})
+        get_filename_component(ex_name ${ex_src} NAME_WE)
+        add_executable(example_${ex_name} ${ex_src})
+        target_link_libraries(example_${ex_name} PRIVATE teide_static)
+        target_include_directories(example_${ex_name} PRIVATE include)
+        if(NOT MSVC)
+            target_link_options(example_${ex_name} PRIVATE
+                $<$<CONFIG:Debug>:-fsanitize=address,undefined>
+            )
+        endif()
+    endforeach()
+endif()
+
 # Test executable
 enable_testing()
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "test/*.c")
@@ -110,3 +127,19 @@ if(TEST_SOURCES)
     endif()
     add_test(NAME test_teide COMMAND test_teide)
 endif()
+
+# Install targets
+include(GNUInstallDirs)
+install(TARGETS teide teide_static
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+install(FILES include/teide/td.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/teide
+)
+
+# pkg-config
+configure_file(teide.pc.in teide.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/teide.pc
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+)

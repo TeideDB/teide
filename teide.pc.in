@@ -1,0 +1,9 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: teide
+Description: Pure C17 columnar dataframe engine with native graph processing
+Version: 0.1.0
+Libs: -L${libdir} -lteide
+Cflags: -I${includedir}
