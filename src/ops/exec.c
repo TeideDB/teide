@@ -7495,7 +7495,10 @@ static void join_radix_hist_fn(void* raw, uint32_t wid, int64_t start, int64_t e
     }
 }
 
-/* Context for parallel partition scatter */
+/* Context for parallel partition scatter.
+ * Uses per-partition atomic offsets because td_pool_dispatch uses dynamic
+ * task scheduling — workers may claim different row ranges in histogram vs
+ * scatter phases, so per-worker offsets would be incorrect. */
 typedef struct {
     td_t**              key_vecs;
     uint8_t             n_keys;
@@ -7503,19 +7506,20 @@ typedef struct {
     uint8_t             radix_shift;
     uint32_t            n_parts;
     join_radix_part_t*  parts;       /* partition descriptors */
-    uint32_t*           offsets;     /* [n_workers][n_parts] per-worker write positions */
+    _Atomic(uint32_t)*  offsets;     /* [n_parts] atomic write positions */
 } join_radix_scatter_ctx_t;
 
 static void join_radix_scatter_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
     join_radix_scatter_ctx_t* c = (join_radix_scatter_ctx_t*)raw;
-    uint32_t* off = c->offsets + (uint32_t)wid * c->n_parts;
     uint32_t mask = c->radix_mask;
     uint8_t shift = c->radix_shift;
 
     for (int64_t r = start; r < end; r++) {
         uint64_t h = hash_row_keys(c->key_vecs, c->n_keys, r);
         uint32_t part = (uint32_t)(h >> shift) & mask;
-        uint32_t pos = off[part]++;
+        uint32_t pos = atomic_fetch_add_explicit(&c->offsets[part], 1,
+                                                  memory_order_relaxed);
         join_radix_entry_t* entries = c->parts[part].entries;
         entries[pos].row_idx = (uint32_t)r;
         entries[pos].hash = (uint32_t)h;  /* lower 32 bits for HT probe */
@@ -7590,10 +7594,10 @@ static join_radix_part_t* join_radix_partition(td_pool_t* pool, td_t** key_vecs,
         return NULL;
     }
 
-    /* Step 2: Compute per-worker write offsets within each partition */
+    /* Step 2: Allocate per-partition atomic scatter offsets (all start at 0) */
     td_t* off_hdr;
-    uint32_t* offsets = (uint32_t*)scratch_alloc(&off_hdr,
-                          (size_t)n_workers * n_parts * sizeof(uint32_t));
+    _Atomic(uint32_t)* offsets = (_Atomic(uint32_t)*)scratch_calloc(&off_hdr,
+                                    (size_t)n_parts * sizeof(_Atomic(uint32_t)));
     if (!offsets) {
         for (uint32_t p = 0; p < n_parts; p++)
             if (parts[p].entries_hdr) scratch_free(parts[p].entries_hdr);
@@ -7601,14 +7605,6 @@ static join_radix_part_t* join_radix_partition(td_pool_t* pool, td_t** key_vecs,
         scratch_free(parts_hdr);
         *parts_hdr_out = NULL;
         return NULL;
-    }
-
-    for (uint32_t p = 0; p < n_parts; p++) {
-        uint32_t running = 0;
-        for (uint32_t w = 0; w < n_workers; w++) {
-            offsets[w * n_parts + p] = running;
-            running += histograms[w * n_parts + p];
-        }
     }
 
     /* Step 3: Scatter rows into partition buffers */

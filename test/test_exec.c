@@ -742,6 +742,80 @@ static MunitResult test_exec_join(const void* params, void* data) {
     return MUNIT_OK;
 }
 
+/* ---- LARGE JOIN (radix-partitioned path) ---- */
+static MunitResult test_exec_join_large(const void* params, void* data) {
+    (void)params; (void)data;
+    td_heap_init();
+    td_sym_init();
+
+    /* Create left table: 100K rows, id = i % 50000, val = i
+     * Each key appears exactly twice on the left side. */
+    int64_t n_left = 100000;
+    td_t* lid_v = td_vec_new(TD_I64, n_left);
+    lid_v->len = n_left;
+    td_t* lval_v = td_vec_new(TD_I64, n_left);
+    lval_v->len = n_left;
+    int64_t* lid = (int64_t*)td_data(lid_v);
+    int64_t* lval = (int64_t*)td_data(lval_v);
+    for (int64_t i = 0; i < n_left; i++) {
+        lid[i] = i % 50000;
+        lval[i] = i;
+    }
+
+    /* Right table: 100K rows, id = i % 50000, score = i * 10
+     * Each key appears exactly twice on the right side. */
+    int64_t n_right = 100000;
+    td_t* rid_v = td_vec_new(TD_I64, n_right);
+    rid_v->len = n_right;
+    td_t* rscore_v = td_vec_new(TD_I64, n_right);
+    rscore_v->len = n_right;
+    int64_t* rid = (int64_t*)td_data(rid_v);
+    int64_t* rscore = (int64_t*)td_data(rscore_v);
+    for (int64_t i = 0; i < n_right; i++) {
+        rid[i] = i % 50000;
+        rscore[i] = i * 10;
+    }
+
+    int64_t n_id = td_sym_intern("id", 2);
+    int64_t n_val = td_sym_intern("val", 3);
+    int64_t n_score = td_sym_intern("score", 5);
+
+    td_t* left = td_table_new(2);
+    left = td_table_add_col(left, n_id, lid_v);
+    left = td_table_add_col(left, n_val, lval_v);
+    td_release(lid_v);
+    td_release(lval_v);
+
+    td_t* right = td_table_new(2);
+    right = td_table_add_col(right, n_id, rid_v);
+    right = td_table_add_col(right, n_score, rscore_v);
+    td_release(rid_v);
+    td_release(rscore_v);
+
+    td_graph_t* g = td_graph_new(left);
+    td_op_t* left_op = td_const_table(g, left);
+    td_op_t* right_op = td_const_table(g, right);
+    td_op_t* lk = td_scan(g, "id");
+    td_op_t* lk_arr[] = { lk };
+    td_op_t* rk_arr[] = { lk };
+    td_op_t* join_op = td_join(g, left_op, lk_arr, right_op, rk_arr, 1, 0);
+
+    td_t* result = td_execute(g, join_op);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(result->type, ==, TD_TABLE);
+    /* 50K keys, 2 left x 2 right = 4 matches per key, total = 200K rows */
+    munit_assert_int(td_table_nrows(result), ==, 200000);
+    munit_assert_true(td_table_ncols(result) >= 3);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(left);
+    td_release(right);
+    td_sym_destroy();
+    td_heap_destroy();
+    return MUNIT_OK;
+}
+
 /* ---- WINDOW ---- */
 static MunitResult test_exec_window(const void* params, void* data) {
     (void)params; (void)data;
@@ -1164,6 +1238,7 @@ static MunitTest exec_tests[] = {
     { "/sort",           test_exec_sort,              NULL, NULL, 0, NULL },
     { "/head_tail",      test_exec_head_tail,         NULL, NULL, 0, NULL },
     { "/join",           test_exec_join,              NULL, NULL, 0, NULL },
+    { "/join_large",     test_exec_join_large,        NULL, NULL, 0, NULL },
     { "/window",         test_exec_window,            NULL, NULL, 0, NULL },
     { "/select",         test_exec_select,            NULL, NULL, 0, NULL },
     { "/stddev",         test_exec_stddev,            NULL, NULL, 0, NULL },

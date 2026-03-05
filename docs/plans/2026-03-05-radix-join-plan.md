@@ -16,7 +16,7 @@
 - [x] Task 2: Implement radix bit selection and partition count/scatter infrastructure
 - [x] Task 3: Implement per-partition open-addressing build + probe
 - [x] Task 4: Wire radix join into exec_join
-- [ ] Task 5: Add join correctness tests
+- [x] Task 5: Add join correctness tests
 - [ ] Task 6: Benchmark and tune
 - [ ] Task 7: Add memory pressure sequential fallback test
 
