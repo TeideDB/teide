@@ -7453,8 +7453,7 @@ typedef struct {
 
 /* Choose radix bits so each partition's HT working set fits in cache.
  * HT working set per partition ≈ 2x right entries × 8B = 16B per right row. */
-static uint8_t radix_join_bits(int64_t right_rows, uint8_t n_keys) {
-    (void)n_keys;
+static uint8_t radix_join_bits(int64_t right_rows) {
     /* HT working set: 2x capacity × 8B slot = 16B per right row */
     size_t right_bytes = (size_t)right_rows * 16;
     if (right_bytes <= TD_JOIN_L2_TARGET)
@@ -7463,12 +7462,11 @@ static uint8_t radix_join_bits(int64_t right_rows, uint8_t n_keys) {
     /* R = ceil(log2(right_bytes / L2_TARGET)) */
     uint8_t r = 0;
     size_t target = TD_JOIN_L2_TARGET;
-    while (target < right_bytes && r < 63) {
+    while (target < right_bytes && r < TD_JOIN_MAX_RADIX) {
         target *= 2;
         r++;
     }
     if (r < TD_JOIN_MIN_RADIX) r = TD_JOIN_MIN_RADIX;
-    if (r > TD_JOIN_MAX_RADIX) r = TD_JOIN_MAX_RADIX;
     return r;
 }
 
@@ -7794,6 +7792,35 @@ typedef struct {
     _Atomic(uint8_t)  had_error;  /* set by any partition on OOM */
 } join_radix_bp_ctx_t;
 
+/* Grow per-partition output buffers (matched pair arrays).
+ * Returns true on success, false on OOM (sets had_error). */
+static inline bool bp_grow_bufs(join_radix_bp_ctx_t* c, uint32_t p,
+                                 int32_t** pl, int32_t** pr,
+                                 uint32_t* cap, uint32_t cnt) {
+    if (cnt < *cap) return true;
+    if (*cap > UINT32_MAX / 2) {
+        atomic_store_explicit(&c->had_error, 1, memory_order_relaxed);
+        return false;
+    }
+    uint32_t new_cap = *cap * 2;
+    td_t* nl_hdr; td_t* nr_hdr;
+    int32_t* nl = (int32_t*)scratch_alloc(&nl_hdr, (size_t)new_cap * sizeof(int32_t));
+    int32_t* nr = (int32_t*)scratch_alloc(&nr_hdr, (size_t)new_cap * sizeof(int32_t));
+    if (!nl || !nr) {
+        if (nl_hdr) scratch_free(nl_hdr);
+        if (nr_hdr) scratch_free(nr_hdr);
+        atomic_store_explicit(&c->had_error, 1, memory_order_relaxed);
+        return false;
+    }
+    memcpy(nl, *pl, (size_t)cnt * sizeof(int32_t));
+    memcpy(nr, *pr, (size_t)cnt * sizeof(int32_t));
+    scratch_free(c->pp_l_hdr[p]); scratch_free(c->pp_r_hdr[p]);
+    *pl = nl; *pr = nr;
+    c->pp_l_hdr[p] = nl_hdr; c->pp_r_hdr[p] = nr_hdr;
+    *cap = new_cap;
+    return true;
+}
+
 static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_start, int64_t task_end) {
     (void)wid; (void)task_end;
     join_radix_bp_ctx_t* c = (join_radix_bp_ctx_t*)raw;
@@ -7894,29 +7921,8 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
                 uint32_t rr = ht[slot * 2 + 1];
                 if (join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys,
                                  (int64_t)lr, (int64_t)rr)) {
-                    /* Grow buffer if needed */
-                    if (cnt >= cap) {
-                        if (cap > UINT32_MAX / 2) {
-                            atomic_store_explicit(&c->had_error, 1, memory_order_relaxed);
-                            goto done;
-                        }
-                        uint32_t new_cap = cap * 2;
-                        td_t* nl_hdr; td_t* nr_hdr;
-                        int32_t* nl = (int32_t*)scratch_alloc(&nl_hdr, (size_t)new_cap * sizeof(int32_t));
-                        int32_t* nr = (int32_t*)scratch_alloc(&nr_hdr, (size_t)new_cap * sizeof(int32_t));
-                        if (!nl || !nr) {
-                            if (nl_hdr) scratch_free(nl_hdr);
-                            if (nr_hdr) scratch_free(nr_hdr);
-                            atomic_store_explicit(&c->had_error, 1, memory_order_relaxed);
-                            goto done;
-                        }
-                        memcpy(nl, pl, (size_t)cnt * sizeof(int32_t));
-                        memcpy(nr, pr, (size_t)cnt * sizeof(int32_t));
-                        scratch_free(c->pp_l_hdr[p]); scratch_free(c->pp_r_hdr[p]);
-                        pl = nl; pr = nr;
-                        c->pp_l_hdr[p] = nl_hdr; c->pp_r_hdr[p] = nr_hdr;
-                        cap = new_cap;
-                    }
+                    if (!bp_grow_bufs(c, p, &pl, &pr, &cap, cnt))
+                        goto done;
                     pl[cnt] = (int32_t)lr;
                     pr[cnt] = (int32_t)rr;
                     cnt++;
@@ -7928,28 +7934,8 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
             slot = (slot + 1) & ht_mask;
         }
         if (!matched && c->join_type >= 1) {
-            if (cnt >= cap) {
-                if (cap > UINT32_MAX / 2) {
-                    atomic_store_explicit(&c->had_error, 1, memory_order_relaxed);
-                    goto done;
-                }
-                uint32_t new_cap = cap * 2;
-                td_t* nl_hdr; td_t* nr_hdr;
-                int32_t* nl = (int32_t*)scratch_alloc(&nl_hdr, (size_t)new_cap * sizeof(int32_t));
-                int32_t* nr = (int32_t*)scratch_alloc(&nr_hdr, (size_t)new_cap * sizeof(int32_t));
-                if (!nl || !nr) {
-                    if (nl_hdr) scratch_free(nl_hdr);
-                    if (nr_hdr) scratch_free(nr_hdr);
-                    atomic_store_explicit(&c->had_error, 1, memory_order_relaxed);
-                    goto done;
-                }
-                memcpy(nl, pl, (size_t)cnt * sizeof(int32_t));
-                memcpy(nr, pr, (size_t)cnt * sizeof(int32_t));
-                scratch_free(c->pp_l_hdr[p]); scratch_free(c->pp_r_hdr[p]);
-                pl = nl; pr = nr;
-                c->pp_l_hdr[p] = nl_hdr; c->pp_r_hdr[p] = nr_hdr;
-                cap = new_cap;
-            }
+            if (!bp_grow_bufs(c, p, &pl, &pr, &cap, cnt))
+                goto done;
             pl[cnt] = (int32_t)lr;
             pr[cnt] = -1;
             cnt++;
@@ -8192,7 +8178,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
 
     /* ── Radix-partitioned path (large joins) ──────────────────────── */
     if (right_rows > TD_PARALLEL_THRESHOLD) {
-        uint8_t radix_bits = radix_join_bits(right_rows, n_keys);
+        uint8_t radix_bits = radix_join_bits(right_rows);
         uint32_t n_rparts = (uint32_t)1 << radix_bits;
 
         /* Pre-compute hashes for both sides (once, reused by histogram+scatter) */
@@ -8394,7 +8380,10 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
             pair_count = total_out;
         }
 
-        /* Free per-partition buffers */
+        /* Free per-partition buffers allocated by worker threads.
+         * Safe: td_pool_dispatch_n has completed (workers are back on semaphore),
+         * td_parallel_flag is 0, and td_free handles cross-heap deallocation
+         * via the foreign-block list flushed by td_heap_gc at td_parallel_end. */
         for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++) {
             if (pp_l_hdr[rp2]) scratch_free(pp_l_hdr[rp2]);
             if (pp_r_hdr[rp2]) scratch_free(pp_r_hdr[rp2]);

@@ -12,16 +12,16 @@
 
 ## Progress
 
-- [ ] Task 1: Fix `radix_join_bits` loop bound
-- [ ] Task 2: Extract buffer growth helper to eliminate duplication
-- [ ] Task 3: Add cross-thread free documentation comment
-- [ ] Task 4: Add empty table join tests
-- [ ] Task 5: Add LEFT OUTER join test (large, radix path)
-- [ ] Task 6: Add FULL OUTER join test (large, radix path)
-- [ ] Task 7: Add skewed keys test (all rows in one partition)
-- [ ] Task 8: Add threshold boundary test (65537 rows)
-- [ ] Task 9: Add multi-key type join test (I64 + F64 mixed keys)
-- [ ] Task 10: Build, run all tests, benchmark regression check
+- [x] Task 1: Fix `radix_join_bits` loop bound
+- [x] Task 2: Extract buffer growth helper to eliminate duplication
+- [x] Task 3: Add cross-thread free documentation comment
+- [x] Task 4: Add empty table join tests
+- [x] Task 5: Add LEFT OUTER join test (large, radix path)
+- [x] Task 6: Add FULL OUTER join test (large, radix path)
+- [x] Task 7: Add skewed keys test (all rows in one partition)
+- [x] Task 8: Add threshold boundary test (65537 rows)
+- [x] Task 9: Add multi-key type join test (I64 + F64 mixed keys)
+- [x] Task 10: Build, run all tests, benchmark regression check
 
 ---
 
@@ -746,7 +746,7 @@ git commit -m "test(join): add threshold boundary test (65537 rows, radix path e
 
 ---
 
-### Task 9: Add multi-key type join test (I64 + F64 mixed keys)
+### Task 9: Add multi-key composite join test (I64 + F64 mixed keys)
 
 **Audit finding:** IMPORTANT — no test with mixed key types.
 
@@ -756,18 +756,18 @@ git commit -m "test(join): add threshold boundary test (65537 rows, radix path e
 **Step 1: Add `test_exec_join_multikey`**
 
 ```c
-/* ---- JOIN: multi-key with mixed types (I64 + I64, two keys) ---- */
+/* ---- JOIN: multi-key composite join (I64 + F64 mixed keys) ---- */
 static MunitResult test_exec_join_multikey(const void* params, void* data) {
     (void)params; (void)data;
     td_heap_init();
     td_sym_init();
 
-    /* Left: 5 rows, join on (k1, k2) */
+    /* Left: 5 rows, join on (k1: I64, k2: F64) — exercises mixed-type key path */
     int64_t lk1[] = {1, 1, 2, 2, 3};
-    int64_t lk2[] = {10, 20, 10, 20, 10};
+    double  lk2[] = {10.0, 20.0, 10.0, 20.0, 10.0};
     int64_t lval[] = {100, 200, 300, 400, 500};
     td_t* lk1_v = td_vec_from_raw(TD_I64, lk1, 5);
-    td_t* lk2_v = td_vec_from_raw(TD_I64, lk2, 5);
+    td_t* lk2_v = td_vec_from_raw(TD_F64, lk2, 5);
     td_t* lval_v = td_vec_from_raw(TD_I64, lval, 5);
 
     int64_t n_k1 = td_sym_intern("k1", 2);
@@ -783,10 +783,10 @@ static MunitResult test_exec_join_multikey(const void* params, void* data) {
 
     /* Right: 3 rows */
     int64_t rk1[] = {1, 2, 3};
-    int64_t rk2[] = {10, 20, 30};
+    double  rk2[] = {10.0, 20.0, 30.0};
     int64_t rscore[] = {1000, 2000, 3000};
     td_t* rk1_v = td_vec_from_raw(TD_I64, rk1, 3);
-    td_t* rk2_v = td_vec_from_raw(TD_I64, rk2, 3);
+    td_t* rk2_v = td_vec_from_raw(TD_F64, rk2, 3);
     td_t* rscore_v = td_vec_from_raw(TD_I64, rscore, 3);
 
     td_t* right = td_table_new(3);
