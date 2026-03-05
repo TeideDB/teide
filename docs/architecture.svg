@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 720" font-family="'SF Mono','Fira Code','Cascadia Code',Menlo,Consolas,monospace" font-size="12">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 720" font-family="'SF Mono','Fira Code','Cascadia Code',Menlo,Consolas,monospace" font-size="12">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#0d1117"/>
@@ -16,80 +16,80 @@
       <stop offset="0%" stop-color="#1f2a1f"/>
       <stop offset="100%" stop-color="#243024"/>
     </linearGradient>
-    <filter id="glow">
-      <feGaussianBlur stdDeviation="2" result="blur"/>
-      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
   </defs>
 
   <!-- Background -->
-  <rect width="520" height="720" rx="12" fill="url(#bg)"/>
+  <rect width="560" height="720" rx="12" fill="url(#bg)"/>
 
   <!-- User Code -->
-  <text x="260" y="36" text-anchor="middle" fill="#8b949e" font-size="13" font-weight="600">User Code</text>
+  <text x="280" y="36" text-anchor="middle" fill="#8b949e" font-size="13" font-weight="600">User Code</text>
 
   <!-- Arrow down -->
-  <line x1="260" y1="46" x2="260" y2="66" stroke="#484f58" stroke-width="1.5"/>
-  <text x="268" y="60" fill="#58a6ff" font-size="10">td_graph_new(tbl)</text>
+  <line x1="280" y1="46" x2="280" y2="66" stroke="#484f58" stroke-width="1.5"/>
+  <polygon points="280,72 275,64 285,64" fill="#484f58"/>
+  <text x="288" y="60" fill="#58a6ff" font-size="9">td_graph_new(tbl)</text>
 
   <!-- Lazy DAG Box -->
-  <rect x="100" y="72" width="320" height="150" rx="8" fill="url(#box1)" stroke="#30363d" stroke-width="1"/>
-  <text x="260" y="96" text-anchor="middle" fill="#58a6ff" font-size="14" font-weight="700">Lazy DAG</text>
-  <line x1="130" y1="106" x2="390" y2="106" stroke="#21262d" stroke-width="1"/>
+  <rect x="80" y="78" width="400" height="150" rx="8" fill="url(#box1)" stroke="#30363d" stroke-width="1"/>
+  <text x="280" y="102" text-anchor="middle" fill="#58a6ff" font-size="14" font-weight="700">Lazy DAG</text>
+  <line x1="110" y1="112" x2="450" y2="112" stroke="#21262d" stroke-width="1"/>
 
   <g fill="#c9d1d9" font-size="11">
-    <text x="140" y="128">td_scan</text>    <text x="260" y="128">td_filter</text>   <text x="370" y="128">td_group</text>
-    <text x="140" y="148">td_join</text>     <text x="260" y="148">td_expand</text>   <text x="370" y="148">td_sort_op</text>
-    <text x="140" y="168">td_window_op</text><text x="260" y="168">td_wco_join</text> <text x="370" y="168">td_asof_join</text>
-    <text x="140" y="188">td_add</text>      <text x="260" y="188">td_eq</text>       <text x="370" y="188">td_like</text>
+    <text x="120" y="134">td_scan</text>      <text x="240" y="134">td_filter</text>     <text x="370" y="134">td_group</text>
+    <text x="120" y="154">td_join</text>       <text x="240" y="154">td_expand</text>     <text x="370" y="154">td_sort_op</text>
+    <text x="120" y="174">td_window_op</text>  <text x="240" y="174">td_wco_join</text>   <text x="370" y="174">td_asof_join</text>
+    <text x="120" y="194">td_add</text>        <text x="240" y="194">td_eq</text>         <text x="370" y="194">td_like</text>
   </g>
-  <text x="260" y="213" text-anchor="middle" fill="#484f58" font-size="10">40+ operators — no execution yet</text>
+  <text x="280" y="219" text-anchor="middle" fill="#484f58" font-size="10">40+ operators — no execution yet</text>
 
   <!-- Arrow down -->
-  <line x1="260" y1="222" x2="260" y2="252" stroke="#484f58" stroke-width="1.5"/>
-  <text x="268" y="242" fill="#58a6ff" font-size="10">td_optimize(g, root)</text>
+  <line x1="280" y1="228" x2="280" y2="252" stroke="#484f58" stroke-width="1.5"/>
+  <polygon points="280,258 275,250 285,250" fill="#484f58"/>
+  <text x="288" y="246" fill="#58a6ff" font-size="9">td_optimize(g, root)</text>
 
   <!-- Optimizer Box -->
-  <rect x="60" y="258" width="400" height="200" rx="8" fill="url(#box2)" stroke="#30363d" stroke-width="1"/>
-  <text x="260" y="282" text-anchor="middle" fill="#3fb950" font-size="14" font-weight="700">Optimizer</text>
-  <text x="260" y="298" text-anchor="middle" fill="#484f58" font-size="10">10 passes, bottom-up then top-down</text>
-  <line x1="90" y1="306" x2="430" y2="306" stroke="#21262d" stroke-width="1"/>
+  <rect x="50" y="264" width="460" height="200" rx="8" fill="url(#box2)" stroke="#30363d" stroke-width="1"/>
+  <text x="280" y="288" text-anchor="middle" fill="#3fb950" font-size="14" font-weight="700">Optimizer</text>
+  <text x="280" y="304" text-anchor="middle" fill="#484f58" font-size="10">10 passes, bottom-up then top-down</text>
+  <line x1="80" y1="312" x2="480" y2="312" stroke="#21262d" stroke-width="1"/>
 
   <g font-size="11">
-    <text x="100" y="328" fill="#8b949e">1.</text><text x="118" y="328" fill="#c9d1d9">Type inference</text>
-    <text x="280" y="328" fill="#8b949e">2.</text><text x="298" y="328" fill="#c9d1d9">Constant folding</text>
-    <text x="100" y="350" fill="#8b949e">3.</text><text x="118" y="350" fill="#c9d1d9">SIP</text>
-    <text x="280" y="350" fill="#8b949e">4.</text><text x="298" y="350" fill="#c9d1d9">Factorize</text>
-    <text x="100" y="372" fill="#8b949e">5.</text><text x="118" y="372" fill="#c9d1d9">Predicate pushdown</text>
-    <text x="280" y="372" fill="#8b949e">6.</text><text x="298" y="372" fill="#c9d1d9">Filter reorder</text>
-    <text x="100" y="394" fill="#8b949e">7.</text><text x="118" y="394" fill="#c9d1d9">Projection pushdown</text>
-    <text x="280" y="394" fill="#8b949e">8.</text><text x="298" y="394" fill="#c9d1d9">Partition pruning</text>
-    <text x="100" y="416" fill="#8b949e">9.</text><text x="118" y="416" fill="#c9d1d9">Fusion</text>
-    <text x="280" y="416" fill="#8b949e">10.</text><text x="302" y="416" fill="#c9d1d9">Dead code elimination</text>
+    <text x="90" y="334" fill="#8b949e">1.</text>  <text x="112" y="334" fill="#c9d1d9">Type inference</text>
+    <text x="300" y="334" fill="#8b949e">2.</text>  <text x="322" y="334" fill="#c9d1d9">Constant folding</text>
+    <text x="90" y="356" fill="#8b949e">3.</text>   <text x="112" y="356" fill="#c9d1d9">SIP</text>
+    <text x="300" y="356" fill="#8b949e">4.</text>  <text x="322" y="356" fill="#c9d1d9">Factorize</text>
+    <text x="90" y="378" fill="#8b949e">5.</text>   <text x="112" y="378" fill="#c9d1d9">Predicate pushdown</text>
+    <text x="300" y="378" fill="#8b949e">6.</text>  <text x="322" y="378" fill="#c9d1d9">Filter reorder</text>
+    <text x="90" y="400" fill="#8b949e">7.</text>   <text x="112" y="400" fill="#c9d1d9">Projection pushdown</text>
+    <text x="300" y="400" fill="#8b949e">8.</text>  <text x="322" y="400" fill="#c9d1d9">Partition pruning</text>
+    <text x="90" y="422" fill="#8b949e">9.</text>   <text x="112" y="422" fill="#c9d1d9">Fusion</text>
+    <text x="300" y="422" fill="#8b949e">10.</text> <text x="326" y="422" fill="#c9d1d9">Dead code elimination</text>
   </g>
-  <text x="260" y="448" text-anchor="middle" fill="#484f58" font-size="10">sideways info passing + graph-aware rewriting</text>
+  <text x="280" y="454" text-anchor="middle" fill="#484f58" font-size="10">sideways info passing + graph-aware rewriting</text>
 
   <!-- Arrow down -->
-  <line x1="260" y1="458" x2="260" y2="488" stroke="#484f58" stroke-width="1.5"/>
-  <text x="268" y="478" fill="#58a6ff" font-size="10">td_execute(g, root)</text>
+  <line x1="280" y1="464" x2="280" y2="488" stroke="#484f58" stroke-width="1.5"/>
+  <polygon points="280,494 275,486 285,486" fill="#484f58"/>
+  <text x="288" y="482" fill="#58a6ff" font-size="9">td_execute(g, root)</text>
 
   <!-- Executor Box -->
-  <rect x="60" y="494" width="400" height="150" rx="8" fill="url(#box3)" stroke="#30363d" stroke-width="1"/>
-  <text x="260" y="518" text-anchor="middle" fill="#f0883e" font-size="14" font-weight="700">Fused Morsel Executor</text>
-  <line x1="90" y1="528" x2="430" y2="528" stroke="#21262d" stroke-width="1"/>
+  <rect x="50" y="500" width="460" height="140" rx="8" fill="url(#box3)" stroke="#30363d" stroke-width="1"/>
+  <text x="280" y="524" text-anchor="middle" fill="#f0883e" font-size="14" font-weight="700">Fused Morsel Executor</text>
+  <line x1="80" y1="534" x2="480" y2="534" stroke="#21262d" stroke-width="1"/>
 
   <g fill="#c9d1d9" font-size="11">
-    <text x="100" y="550">Bytecode over register slots</text>
-    <text x="100" y="572">1024-element morsels (L1 cache resident)</text>
-    <text x="100" y="594">Radix-partitioned hash joins (L2 tuned)</text>
-    <text x="100" y="616">Parallel thread pool dispatch</text>
+    <text x="90" y="556">Bytecode over register slots</text>
+    <text x="90" y="576">1024-element morsels (L1 resident)</text>
+    <text x="90" y="596">Radix-partitioned hash joins (L2)</text>
+    <text x="90" y="616">Parallel thread pool dispatch</text>
   </g>
-  <text x="260" y="636" text-anchor="middle" fill="#484f58" font-size="10">element-wise ops fused into single morsel pass</text>
+  <text x="280" y="632" text-anchor="middle" fill="#484f58" font-size="10">element-wise ops fused into single morsel pass</text>
 
   <!-- Arrow down -->
-  <line x1="260" y1="644" x2="260" y2="674" stroke="#484f58" stroke-width="1.5"/>
+  <line x1="280" y1="640" x2="280" y2="670" stroke="#484f58" stroke-width="1.5"/>
+  <polygon points="280,676 275,668 285,668" fill="#484f58"/>
 
   <!-- Result -->
-  <rect x="180" y="678" width="160" height="32" rx="6" fill="#1a2332" stroke="#58a6ff" stroke-width="1"/>
-  <text x="260" y="699" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="600">td_t* result</text>
+  <rect x="190" y="680" width="180" height="32" rx="6" fill="#1a2332" stroke="#58a6ff" stroke-width="1"/>
+  <text x="280" y="701" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="600">td_t* result</text>
 </svg>
