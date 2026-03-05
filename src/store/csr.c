@@ -23,6 +23,7 @@
 
 #include "csr.h"
 #include "mem/sys.h"
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>

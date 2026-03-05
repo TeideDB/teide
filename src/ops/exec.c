@@ -3377,6 +3377,7 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
     int64_t ncols = td_table_ncols(tbl);
     if (ncols > 4096) return TD_ERR_PTR(TD_ERR_NYI); /* stack safety */
     uint8_t n_sort = ext->sort.n_cols;
+    if (n_sort > 16) return TD_ERR_PTR(TD_ERR_NYI); /* radix_encode_ctx_t limit */
 
     /* Allocate index array */
     td_t* indices_hdr;
