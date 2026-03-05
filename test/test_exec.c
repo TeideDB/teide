@@ -1017,6 +1017,22 @@ static MunitResult test_exec_asof_join(const void* params, void* data) {
     /* Should have left cols + bid (time/sym deduplicated) */
     munit_assert_int(td_table_ncols(result), ==, 4);  /* time, sym, price, bid */
 
+    /* Verify bid values — DuckDB semantics: best right.time <= left.time per partition */
+    td_t* bid_col = td_table_get_col(result, n_bid);
+    munit_assert_ptr_not_null(bid_col);
+    double* bid_data = (double*)td_data(bid_col);
+    /* Sorted output order is by (sym, time): sym=1 rows first, then sym=2 */
+    /* sym=1,t=100: right sym=1,t=90 -> bid=9.5 */
+    munit_assert_double(bid_data[0], ==, 9.5);
+    /* sym=1,t=200: right sym=1,t=150 -> bid=15.0 */
+    munit_assert_double(bid_data[1], ==, 15.0);
+    /* sym=1,t=400: right sym=1,t=350 -> bid=35.0 */
+    munit_assert_double(bid_data[2], ==, 35.0);
+    /* sym=2,t=300: right sym=2,t=250 -> bid=25.0 */
+    munit_assert_double(bid_data[3], ==, 25.0);
+    /* sym=2,t=500: right sym=2,t=450 -> bid=45.0 */
+    munit_assert_double(bid_data[4], ==, 45.0);
+
     td_release(result);
     td_graph_free(g);
     td_release(left);
@@ -1066,6 +1082,13 @@ static MunitResult test_exec_asof_left_join(const void* params, void* data) {
     munit_assert_false(TD_IS_ERR(result));
     /* Left outer: all 3 left rows preserved */
     munit_assert_int(td_table_nrows(result), ==, 3);
+    /* Verify: time=50 has no match (before any right row), bid should be 0 (NULL fill) */
+    td_t* bid_col = td_table_get_col(result, n_bid);
+    munit_assert_ptr_not_null(bid_col);
+    double* bid_data = (double*)td_data(bid_col);
+    munit_assert_double(bid_data[0], ==, 0.0);   /* t=50: no match */
+    munit_assert_double(bid_data[1], ==, 0.8);   /* t=100: right t=80 */
+    munit_assert_double(bid_data[2], ==, 1.5);   /* t=200: right t=150 */
 
     td_release(result);
     td_graph_free(g);

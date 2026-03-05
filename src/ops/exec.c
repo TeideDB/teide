@@ -8155,33 +8155,40 @@ static td_t* exec_window_join(td_graph_t* g, td_op_t* op,
         return TD_ERR_PTR(TD_ERR_OOM);
     }
 
-    /* Two-pointer merge */
-    int64_t rp = 0;  /* right pointer */
+    /* Two-pointer merge with best-match carry-forward */
+    int64_t rp = 0;        /* right pointer (only advances) */
+    int64_t best_ri = -1;  /* best right match in current partition */
     for (int64_t lp = 0; lp < left_n; lp++) {
         int64_t li = li_idx[lp];
-        match[lp] = -1;  /* no match yet */
 
-        /* Advance right pointer while right row is <= left row */
+        /* Detect partition change — reset best match */
+        if (lp > 0) {
+            int64_t prev_li = li_idx[lp - 1];
+            int changed = 0;
+            for (uint8_t k = 0; k < n_eq; k++) {
+                if (lt_eq[k][li] != lt_eq[k][prev_li]) { changed = 1; break; }
+            }
+            if (changed) best_ri = -1;
+        }
+
+        /* Advance right pointer, accumulating best match */
         while (rp < right_n) {
             int64_t ri = ri_idx[rp];
-            /* Check eq_keys match */
             int eq_cmp = 0;
             for (uint8_t k = 0; k < n_eq && eq_cmp == 0; k++) {
                 if (rt_eq[k][ri] < lt_eq[k][li]) eq_cmp = -1;
                 else if (rt_eq[k][ri] > lt_eq[k][li]) eq_cmp = 1;
             }
-            if (eq_cmp > 0) break;  /* right partition past left partition */
-            if (eq_cmp == 0 && rt_time[ri] <= lt_time[li]) {
-                match[lp] = ri;  /* candidate — will be overwritten by later (closer) matches */
+            if (eq_cmp > 0) break;  /* right partition past left */
+            if (eq_cmp == 0) {
+                if (rt_time[ri] <= lt_time[li])
+                    best_ri = ri;  /* valid candidate */
+                else
+                    break;  /* right time past left time */
             }
-            if (eq_cmp == 0 && rt_time[ri] > lt_time[li]) break;  /* past time window */
             rp++;
         }
-
-        /* The right pointer stays where it is for the next left row because:
-           - left is sorted by (eq_keys, time), so next left.time >= current left.time
-           - the right pointer only needs to advance further (merge property)
-           - if partitions change, we continue advancing naturally */
+        match[lp] = best_ri;
     }
 
     /* Count output rows */
