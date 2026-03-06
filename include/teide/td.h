@@ -403,6 +403,7 @@ static inline uint8_t td_sym_dict_width(int64_t dict_size) {
 #define OP_VAR_EXPAND    81   /* variable-length BFS/DFS            */
 #define OP_SHORTEST_PATH 82   /* BFS shortest path                  */
 #define OP_WCO_JOIN      83   /* worst-case optimal join (LFTJ)     */
+#define OP_UNION_ALL     84   /* row-union of two same-schema tables */
 
 /* Opcodes — Misc */
 #define OP_ALIAS        70
@@ -889,6 +890,11 @@ td_op_t* td_shortest_path(td_graph_t* g, td_op_t* src, td_op_t* dst,
 td_op_t* td_wco_join(td_graph_t* g,
                       td_rel_t** rels, uint8_t n_rels,
                       uint8_t n_vars);
+
+/* Row-union (UNION ALL) of two tables with the same schema.
+ * Does NOT deduplicate — equivalent to SQL UNION ALL.
+ * Both inputs must have the same number of columns and compatible types. */
+td_op_t* td_union_all(td_graph_t* g, td_op_t* left, td_op_t* right);
 
 /* CSR / Relationship API */
 td_rel_t* td_rel_build(td_t* from_table, const char* fk_col,

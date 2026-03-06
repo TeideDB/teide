@@ -12286,6 +12286,42 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             return exec_wco_join(g, op);
         }
 
+        case OP_UNION_ALL: {
+            td_t* left = exec_node(g, op->inputs[0]);
+            if (!left || TD_IS_ERR(left)) return left;
+            td_t* right = exec_node(g, op->inputs[1]);
+            if (!right || TD_IS_ERR(right)) { td_release(left); return right; }
+            if (left->type != TD_TABLE || right->type != TD_TABLE) {
+                td_release(left); td_release(right);
+                return TD_ERR_PTR(TD_ERR_NYI);
+            }
+            /* Short-circuit: empty table on either side avoids td_vec_concat
+             * type errors when columns have no rows (and thus no inferred type).
+             * This is also the hot path for Datalog fixpoint — the initial
+             * derived relation is always empty. */
+            if (td_table_nrows(left) == 0) {
+                td_release(left);
+                return right;
+            }
+            if (td_table_nrows(right) == 0) {
+                td_release(right);
+                return left;
+            }
+            int64_t ncols = td_table_ncols(left);
+            td_t* result = td_table_new(ncols);
+            for (int64_t i = 0; i < ncols; i++) {
+                td_t* lcol = td_table_get_col_idx(left, i);
+                td_t* rcol = td_table_get_col_idx(right, i);
+                int64_t name_id = td_table_col_name(left, i);
+                td_t* merged = td_vec_concat(lcol, rcol);
+                result = td_table_add_col(result, name_id, merged);
+                td_release(merged);
+            }
+            td_release(left);
+            td_release(right);
+            return result;
+        }
+
         default:
             return TD_ERR_PTR(TD_ERR_NYI);
     }

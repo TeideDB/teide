@@ -1161,3 +1161,7 @@ td_op_t* td_wco_join(td_graph_t* g,
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
 }
+
+td_op_t* td_union_all(td_graph_t* g, td_op_t* left, td_op_t* right) {
+    return make_binary(g, OP_UNION_ALL, left, right, TD_TABLE);
+}
